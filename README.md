@@ -70,21 +70,19 @@ Standard enrichment plots
 
 
 
-<h2><strong>Single-cell RNA-seq Pipeline (MiBrain / Minerva)</strong></h2>
+## Single-cell RNA-seq Pipeline (MiBrain / Minerva)
 
-<p><strong>Preprocessing, QC, integration, clustering, annotation, and downstream analyses for MiBrain scRNA-seq data</strong></p>
+**Preprocessing, QC, integration, clustering, annotation, and downstream analyses for MiBrain scRNA-seq data**
 
-<hr />
+---
 
-<h3>Pipeline overview (exact order)</h3>
+### Pipeline overview (exact order)
 
-<ol>
-<li><strong>Cell Ranger</strong> — alignment and gene-level quantification</li>
-<li><strong>CellBender</strong> — ambient/background RNA removal</li>
-<li><strong>QC and filtering</strong> (per-sample)</li>
-<li><strong>Seurat + Harmony integration, clustering, and annotation</strong></li>
-<li><strong>Cell-type–specific downstream analyses</strong> (e.g., microglia)</li>
-</ol>
+1. **Cell Ranger** — alignment and gene-level quantification  
+2. **CellBender** — ambient/background RNA removal  
+3. **QC and filtering** (per-sample)  
+4. **Seurat + Harmony integration, clustering, and annotation**  
+5. **Cell-type–specific downstream analyses** (e.g., microglia)
 
 
 
