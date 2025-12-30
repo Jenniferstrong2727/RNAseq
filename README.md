@@ -74,8 +74,7 @@ Standard enrichment plots
 
 **Preprocessing, QC, integration, clustering, annotation, and downstream analyses for MiBrain scRNA-seq data**
 
----
-
+===
 ### Pipeline overview (exact order)
 
 1. **Cell Ranger** — alignment and gene-level quantification  
@@ -83,6 +82,7 @@ Standard enrichment plots
 3. **QC and filtering** (per-sample)  
 4. **Seurat + Harmony integration, clustering, and annotation**  
 5. **Cell-type–specific downstream analyses** (e.g., microglia)
+
 
 
 
