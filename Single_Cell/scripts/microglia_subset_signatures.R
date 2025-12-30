@@ -1,5 +1,5 @@
 ###############################################################################
-# microglia_pipeline_cleaned.R
+# microglia_subset_signatures.R
 #
 # Clean, modular, and generic pipeline to:
 #  - identify microglia from score/module columns
