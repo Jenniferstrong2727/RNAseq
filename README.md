@@ -1,155 +1,153 @@
 # RNA-seq Pipelines (MiBrain / Minerva)
 
-This repository contains pipelines and documentation for running both **single-cell** and **bulk** RNA-seq analysis on the Minerva HPC cluster.
+This repository contains pipelines and documentation for running **single-cell** and **bulk RNA-seq** analyses for MiBrain projects on the Minerva HPC cluster.
 
-- `Single_Cell/` — 10x Genomics single-cell RNA-seq preprocessing + integration (Cell Ranger → CellBender → Seurat + Harmony).
-- `Bulk/` — bulk RNA-seq analysis using RAPiD, DESeq2, and pathway analysis (GSEA + ORA).
+The repository is organized into two primary workflows:
+
+- **Single-cell RNA-seq** — 10x Genomics data preprocessing, QC, integration, and downstream cell-type–specific analyses  
+- **Bulk RNA-seq** — alignment, quantification, differential expression, and pathway analysis  
 
 ---
 
-## 1. Single-cell RNA-seq Pipeline (MiBrain / Minerva)
+# 1. Single-cell RNA-seq Pipeline (MiBrain / Minerva)
 
-This pipeline covers preprocessing and integration for MiBrain single-cell RNA-seq data on Minerva.
+The single-cell pipeline covers preprocessing, QC, integration, clustering, annotation, and downstream analyses for MiBrain scRNA-seq data.
 
-Currently includes:
+## 1.1 Pipeline overview (exact order)
 
-- **Cell Ranger** (10x Genomics) for alignment and gene-level quantification  
-- **CellBender** (Broad) for removal of ambient/background RNA  
-- **Seurat + Harmony** for downstream integration, clustering, marker detection, and simple module scores
+1. **Cell Ranger** — alignment and gene-level quantification  
+2. **CellBender** — ambient/background RNA removal  
+3. **QC and filtering** (per-sample)  
+4. **Seurat + Harmony integration, clustering, and annotation**  
+5. **Cell-type–specific downstream analyses** (e.g., microglia)
 
-### Folder structure
+---
+
+## 1.2 Folder structure (Single-cell)
 
 ```text
 Single_Cell/
 ├── scripts/
-│   ├── run_cellranger_all.sh        # submit Cell Ranger jobs for all samples
-│   ├── run_cellbender_all.sh        # submit CellBender jobs for all samples
-│   └── Seurat_integration_harmony.R # Seurat + Harmony integration, clustering, markers
+│   ├── run_cellranger_all.sh
+│   ├── run_cellbender_all.sh
+│   ├── miBrain_QC_filtering.R
+│   ├── Seurat_integration_harmony.R
+│   └── microglia_subset_signatures.R
 └── docs/
-    └── (analysis notes, troubleshooting, etc.)
-1.1 Cell Ranger
+    └── (analysis notes, troubleshooting, version info)
+
+
+
+1.3 Key scripts (Single-cell)
+Cell Ranger
 Script: Single_Cell/scripts/run_cellranger_all.sh
-Runs 10x Genomics Cell Ranger for all samples in the project. This step:
-
-Aligns reads
-Performs basic QC
-Generates gene-level count matrices (per sample)
-Example usage (on Minerva):
-# From your project directory on Minerva
-./Single_Cell/scripts/run_cellranger_all.sh
-(See comments inside the script for required input paths and sample lists.)
-1.2 CellBender
+Runs 10x Genomics Cell Ranger for all samples:
+Alignment
+Basic QC
+Gene-level count matrices (per sample)
+CellBender
 Script: Single_Cell/scripts/run_cellbender_all.sh
-Runs CellBender on the Cell Ranger outputs to remove ambient/background RNA.
-
-Example usage (on Minerva):
-
-# From your project directory on Minerva
-./Single_Cell/scripts/run_cellbender_all.sh
-This produces cleaned HDF5 matrices (one per sample), which can then be loaded into R / Seurat.
-1.3 Seurat + Harmony Integration
+Removes ambient/background RNA from Cell Ranger outputs, producing cleaned HDF5 matrices.
+QC and filtering (per-sample)
+Script: Single_Cell/scripts/miBrain_QC_filtering.R
+Cell-level QC filtering (features, counts, mitochondrial content)
+Removal of low-quality cells
+Outputs QC’d per-sample Seurat objects
+No cell-type annotation performed at this stage
+Seurat + Harmony integration and annotation
 Script: Single_Cell/scripts/Seurat_integration_harmony.R
-This script is a general template for integrating multiple scRNA-seq samples after CellBender using Seurat and Harmony. It:
+SCTransform normalization
+Sample integration
+Harmony batch correction
+Clustering and UMAP
+Marker detection
+Cell-type annotation
+Microglia subset and gene signature analysis
+Script: Single_Cell/scripts/microglia_subset_signatures.R
+Downstream analysis performed after integration, including:
+Identification and subsetting of microglia
+Microglial reprocessing and subclustering
+Module scoring and cluster-level summaries
+Genotype enrichment analyses
+Publication-ready plots and heatmaps
+Saving of a microglia-specific Seurat object
 
-Loads a list of per-sample QC’d Seurat objects (one per sample)
-Runs SCTransform normalization
-Performs SCT-based integration across samples
-Applies Harmony batch correction on the PCA embeddings
-Computes neighbors, clusters, and UMAP
-Finds cluster markers with FindAllMarkers
-Optionally computes simple module scores for broad cell types
-(e.g., neurons, astrocytes, microglia)
-Example usage (on Minerva):
-module load R/4.2.0
-
-Rscript Single_Cell/scripts/Seurat_integration_harmony.R
-Before running, edit the top of Seurat_integration_harmony.R and set:
-qc_list_path – path to your saved Seurat list of QC’d samples
-output_dir – directory where integrated objects, plots, markers, and module scores will be saved
-1.4 Docs and Notes (Single-cell)
-Additional notes, version info, and troubleshooting tips for the single-cell pipeline live under:
-Single_Cell/docs/
-Suggested files:
-Seurat_integration_harmony_notes.md – R / Seurat / Harmony versions, common errors, and fixes
-cellranger_cellbender_pipeline_notes.md – run logs, flags, and cluster config details
-1.5 Example MiBrain project layout on Minerva
-For reference, a typical project directory for the MiBrain P2RY12 single-cell data:
+1.4 Example MiBrain single-cell project layout (Minerva)
 /sc/arion/projects/ad-omics/Jennifer/scRNA_mibrain_P2RY12
-├── 00_fastq/          # new MiBrain FASTQs (RunMiBrain-1..8)
-├── 01_pilot_fastq/    # symlinks to pilot FASTQs (miBrain-1, miBrain-2)
-├── 02_cellranger/     # Cell Ranger outputs (one folder per sample)
-├── 03_cellbender/     # CellBender outputs (one folder per sample)
-├── 04_seurat_objects/ # downstream analysis in R
-├── logs/              # LSF logs for Cell Ranger / CellBender
+├── 00_fastq/          # raw FASTQs
+├── 01_pilot_fastq/    # pilot FASTQs / symlinks
+├── 02_cellranger/     # Cell Ranger outputs
+├── 03_cellbender/     # CellBender outputs
+├── 04_seurat_objects/ # downstream R analysis
+├── logs/              # LSF logs
 └── metadata/          # sample sheets, etc.
-Convenience commands:
-# Submit all Cell Ranger jobs
-./Single_Cell/scripts/run_cellranger_all.sh
 
-# After Cell Ranger finishes (or partially finishes):
-./Single_Cell/scripts/run_cellbender_all.sh
-2. Bulk RNA-seq Pipeline Overview
-The bulk RNA-seq pipeline is organized into four main stages:
-RAPiD — preprocessing, QC, alignment, and quantification
-Collate Samples (coming soon) — combine featureCounts outputs into a unified matrix
-DEG Analysis — differential expression with DESeq2
-Pathway Analysis — GSEA + ORA using fgsea and clusterProfiler
-Detailed documentation for each stage lives in the Bulk/docs/ directory.
-2.1 Repository structure (Bulk)
+
+
+
+
+
+
+
+# 2. **Bulk RNA-seq Pipeline (MiBrain / Minerva)**
+
+The bulk RNA-seq pipeline supports alignment, quantification, differential expression, and pathway analysis for bulk RNA-seq datasets.
+
+---
+
+## 2.1 **Pipeline overview**
+
+1. **RAPiD** — preprocessing, QC, alignment, and quantification  
+2. **Collate samples** (planned) — combine count matrices  
+3. **Differential expression analysis** — DESeq2  
+4. **Pathway analysis** — GSEA and ORA  
+
+---
+
+## 2.2 **Folder structure (Bulk)**
+
+```text
 Bulk/
 ├── scripts/
-│   ├── 00_run_RAPiD.sh              # run RAPiD preprocessing
-│   ├── 01_collate_samples.R         # (coming soon) create combined count matrix
-│   ├── BULK_rnaseq_DEG.R            # differential expression (DESeq2)
-│   └── BULK_rnaseq_pathway_1.R      # GSEA + ORA pathway analysis
-│
+│   ├── 00_run_RAPiD.sh
+│   ├── 01_collate_samples.R         # coming soon
+│   ├── BULK_rnaseq_DEG.R
+│   └── BULK_rnaseq_pathway_1.R
 └── docs/
-    ├── RAPiD_details.md             # what RAPiD does and key outputs
-    ├── RAPiD_tips_jen.md            # Jen’s practical tips for running RAPiD on Minerva
-    └── DEG_pathway_details.md       # combined DEG + pathway documentation
-2.2 RAPiD — Preprocessing / Alignment / QC
+    ├── RAPiD_details.md
+    ├── RAPiD_tips_jen.md
+    └── DEG_pathway_details.md
+
+
+
+2.3 RAPiD — preprocessing / alignment / QC
 RAPiD performs:
 Adapter trimming (Trimmomatic)
 QC (FastQC, Picard)
 Alignment (STAR)
 Gene quantification (featureCounts, Salmon, Kallisto, RSEM)
 Splicing analysis (LeafCutter)
-Aggregated QC reports (MultiQC HTML)
-Further details:
-Bulk/docs/RAPiD_details.md — full description of each step
-Bulk/docs/RAPiD_tips_jen.md — practical tips for running RAPiD on Minerva
-2.3 Collate Samples — (Coming soon)
-This stage will:
-Read RAPiD featureCounts outputs
-Combine them into a unified gene × sample matrix (.tsv)
-Standardize column names
-Prepare the counts matrix for DESeq2
-Planned locations:
-Script: Bulk/scripts/01_collate_samples.R
-Docs: Bulk/docs/collate_samples_details.md
-2.4 DEG Analysis — Differential Expression (DESeq2)
+Aggregated QC reports (MultiQC)
+Documentation:
+Bulk/docs/RAPiD_details.md
+Bulk/docs/RAPiD_tips_jen.md
+2.4 Differential expression analysis (DESeq2)
 Script: Bulk/scripts/BULK_rnaseq_DEG.R
-Takes as input:
-
+Inputs:
 featureCounts matrix
-Sample metadata (sample, genotype, handler, etc.)
-Produces:
-results_raw.rds
-results_shrunken_apeglm.rds
-QC plots and top tables
-Details and examples: Bulk/docs/DEG_pathway_details.md.
-2.5 Pathway Analysis — GSEA + ORA
+Sample metadata
+Outputs:
+Raw and shrunken DEG results
+QC plots and result tables
+2.5 Pathway analysis (GSEA + ORA)
 Script: Bulk/scripts/BULK_rnaseq_pathway_1.R
-Uses the DESeq2 output to perform:
-
-GSEA using fgseaMultilevel
-Over-representation analysis (ORA) for KEGG, GO BP, Hallmark, etc., via clusterProfiler
-Standard dot plots and enrichment plots
-More documentation: Bulk/docs/DEG_pathway_details.md.
+GSEA (fgseaMultilevel)
+Over-representation analysis (KEGG, GO, Hallmark)
+Standard enrichment plots
 2.6 Bulk documentation summary
-All bulk RNA-seq docs:
-Bulk/docs/RAPiD_details.md — full RAPiD step descriptions
-Bulk/docs/RAPiD_tips_jen.md — Jen’s RAPiD tips on Minerva
-Bulk/docs/DEG_pathway_details.md — DESeq2 + GSEA/ORA workflow
-(planned) Bulk/docs/collate_samples_details.md — collating featureCounts outputs
-
+All bulk RNA-seq documentation lives under:
+Bulk/docs/
+Notes
+This repository is designed for use on the Minerva HPC cluster
+Script headers contain required input paths and configuration details
+Documentation is intentionally modular so pipelines can be adapted to new projects
