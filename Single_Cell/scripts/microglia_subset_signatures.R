@@ -671,8 +671,395 @@ str(mg@misc$gene_signatures, max.level = 1)
 
 out_rds <- file.path(outdir, microglia_rds_name)
 saveRDS(mg, file = out_rds, compress = save_rds_compress)
-log_msg("Saved final microglia object to: ", out_rds)
+log_msg("Saved microglia object to: ", out_rds)
 
+
+########################
+#added on to prepare for psuedobulking
+########################
+
+                      
+#!/usr/bin/env Rscript
+# microglia_assign_MG_STATE.R
+# Generic script to assign cluster -> MG_STATE (Homeostatic / Activated / DAM)
+# using per-gene z (cluster-level) and output canonical CSVs + RDS.
+#
+# Usage: source() or run in an active R session after setting params at top.
+
+# --------- PARAMETERS (edit) -----------
+input_rds <- "Microglia_gene_signatures.rds"   # input Seurat RDS (generic path)
+outdir <- "outputs_microglia_MG_state"         # output folder (created if missing)
+seurat_obj_varname <- "obj"                    # variable name to assign the Seurat object to
+output_rds <- file.path(outdir, "Microglia_MG_state.rds")
+# ----------------------------------------
+
+# --------- Libraries ----------
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(tibble)
+})
+
+# --------- small logger ----------
+log_msg <- function(...) message(paste0(...))
+
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# --------- 0. Load object (generic) ----------
+stopifnot(file.exists(input_rds))
+log_msg("Loading input RDS: ", input_rds)
+tmp_obj <- readRDS(input_rds)
+assign(seurat_obj_varname, tmp_obj)
+rm(tmp_obj)
+obj <- get(seurat_obj_varname)
+stopifnot(inherits(obj, "Seurat"))
+log_msg("Object loaded. DefaultAssay: ", DefaultAssay(obj))
+
+# ensure basic metadata fields exist
+required_meta <- c("mg_cluster", "sample_id", "genotype", "batch")
+missing_meta <- setdiff(required_meta, colnames(obj@meta.data))
+if (length(missing_meta) > 0) {
+  stop("Missing required metadata columns: ", paste(missing_meta, collapse = ", "))
+}
+
+# --------- 1. Marker sets (edit if you want different panels) ----------
+MG_HOMEOSTATIC <- c("P2RY12","TMEM119","SALL1","CX3CR1","CSF1R","FCRLS","GPR34","P2RX7")
+MG_ACTIVATED   <- c("HLA-DRA","CD68","CD74","ITGAM","ITGB2","CD40","CD86","CD14")
+MG_DAM         <- c("TREM2","APOE","SPP1","GPNMB","TYROBP","LPL","CD9","CST7")
+
+state_marker_list <- list(
+  Homeostatic = MG_HOMEOSTATIC,
+  Activated   = MG_ACTIVATED,
+  DAM         = MG_DAM
+)
+
+# Check presence of marker genes in RNA assay
+DefaultAssay(obj) <- "RNA"
+present_genes <- intersect(unique(unlist(state_marker_list)), rownames(obj))
+missing_genes <- setdiff(unique(unlist(state_marker_list)), present_genes)
+if (length(missing_genes) > 0) {
+  log_msg("Warning - missing genes (will be skipped): ", paste(missing_genes, collapse = ", "))
+} else {
+  log_msg("All marker genes present.")
+}
+
+# --------- 2. Compute cluster-level mean expression and per-gene z across clusters ----------
+# Use layer = "data" for Seurat v5 compatibility (log-normalized values in RNA@data)
+expr_layer <- "data"
+log_msg("Reading expression data (layer = '", expr_layer, "') and computing AverageExpression by mg_cluster.")
+avg_list <- AverageExpression(obj, assays = "RNA", slot = expr_layer, group.by = "mg_cluster", verbose = FALSE)
+avg_mat <- avg_list$RNA   # genes x clusters
+
+cluster_names <- colnames(avg_mat)
+log_msg("Clusters found in average expression matrix: ", paste(cluster_names, collapse = ", "))
+
+marker_genes <- intersect(unique(unlist(state_marker_list)), rownames(avg_mat))
+if (length(marker_genes) == 0) stop("None of the marker genes are present in avg_mat. Aborting.")
+
+avg_markers_mat <- avg_mat[marker_genes, , drop = FALSE]
+
+per_gene_z <- function(mat) {
+  # per-gene z-score across clusters (rows = genes)
+  z <- t(scale(t(as.matrix(mat)), center = TRUE, scale = TRUE))
+  z[is.na(z)] <- 0
+  return(z)
+}
+mat_z <- per_gene_z(avg_markers_mat)
+
+# Write cluster gene mean expression and z
+cluster_gene_mean_expr <- as.data.frame(avg_markers_mat) %>% rownames_to_column("gene")
+fn_meanexpr <- file.path(outdir, "cluster_gene_mean_expr_genes_x_clusters.csv")
+write_csv(cluster_gene_mean_expr, fn_meanexpr)
+
+cluster_gene_z <- as.data.frame(mat_z) %>% rownames_to_column("gene")
+fn_genez <- file.path(outdir, "cluster_gene_z_genes_x_clusters.csv")
+write_csv(cluster_gene_z, fn_genez)
+
+log_msg("Wrote: ", fn_meanexpr)
+log_msg("Wrote: ", fn_genez)
+
+# --------- 3. Compute cluster × state scores (mean z across marker genes for each state) ----------
+clusters <- colnames(mat_z)
+cluster_state_scores <- matrix(NA_real_, nrow = length(clusters), ncol = length(state_marker_list),
+                               dimnames = list(clusters, names(state_marker_list)))
+
+for (st in names(state_marker_list)) {
+  genes_st <- intersect(state_marker_list[[st]], rownames(mat_z))
+  if (length(genes_st) == 0) {
+    cluster_state_scores[, st] <- 0
+  } else {
+    cluster_state_scores[, st] <- colMeans(mat_z[genes_st, , drop = FALSE], na.rm = TRUE)
+  }
+}
+cluster_state_scores_df <- as.data.frame(cluster_state_scores) %>% rownames_to_column("cluster")
+fn_cluster_state_scores <- file.path(outdir, "cluster_state_scores_meanZ.csv")
+write_csv(cluster_state_scores_df, fn_cluster_state_scores)
+log_msg("Wrote: ", fn_cluster_state_scores)
+
+# --------- 4. Assign cluster -> MG_STATE by top mean z; compute delta and confidence ----------
+# ensure cluster column present
+cluster_state_scores_df <- cluster_state_scores_df %>% mutate(cluster = as.character(cluster))
+
+# identify numeric state columns
+state_score_cols <- cluster_state_scores_df %>% select(-cluster) %>% select(where(is.numeric)) %>% colnames()
+if (length(state_score_cols) < 1) stop("No numeric state-score columns found in cluster_state_scores_df.")
+
+# compute assigned state, deltas, cluster sizes
+cluster_to_state_df <- cluster_state_scores_df %>%
+  rowwise() %>%
+  mutate(
+    .vals = list(c_across(all_of(state_score_cols))),
+    best_i = which.max(.vals),
+    ord = list(order(.vals, decreasing = TRUE)),
+    second_i = ifelse(length(.vals) >= 2, ord[[1]][2], NA_integer_),
+    assigned_state = state_score_cols[best_i],
+    top_mean_z = as.numeric(.vals[best_i]),
+    second_mean_z = ifelse(!is.na(second_i), as.numeric(.vals[second_i]), NA_real_),
+    delta_z = top_mean_z - second_mean_z,
+    n_cells_in_cluster = as.integer(ifelse(as.character(cluster) %in% names(table(obj$mg_cluster)),
+                                           table(obj$mg_cluster)[as.character(cluster)],
+                                           ifelse(sub("^(?:g|G|MG|mg)?", "", cluster) %in% names(table(sub("^(?:g|G|MG|mg)?", "", obj$mg_cluster))),
+                                                  table(sub("^(?:g|G|MG|mg)?", "", obj$mg_cluster))[sub("^(?:g|G|MG|mg)?", "", cluster)],
+                                                  0))),
+    note_flag = NA_character_
+  ) %>%
+  ungroup() %>%
+  select(-.vals, -best_i, -ord, -second_i)
+
+# set confidence levels (relaxed thresholds — adjust if you want stricter)
+cluster_to_state_df <- cluster_to_state_df %>%
+  mutate(
+    conf_level = case_when(
+      is.na(delta_z) ~ "low",
+      delta_z >= 0.30 ~ "high",
+      delta_z >= 0.10 ~ "moderate",
+      TRUE ~ "low"
+    ),
+    note_flag = ifelse(n_cells_in_cluster < 20, paste0("small_n=", n_cells_in_cluster), note_flag)
+  )
+
+# Write cluster->state mapping
+fn_cluster_to_state <- file.path(outdir, "cluster_to_state.csv")
+write_csv(cluster_to_state_df, fn_cluster_to_state)
+log_msg("Wrote: ", fn_cluster_to_state)
+
+# --------- 5. Robust mapping keys and per-cell assignment ----------
+cts <- cluster_to_state_df %>%
+  mutate(mg_cluster_key = as.character(cluster),
+         mg_cluster_key_num = sub("^(?:g|G|MG|mg)?", "", mg_cluster_key))
+
+map_conf_primary <- setNames(cts$conf_level, cts$mg_cluster_key)
+map_delta_primary <- setNames(cts$delta_z, cts$mg_cluster_key)
+map_state_primary <- setNames(cts$assigned_state, cts$mg_cluster_key)
+
+map_conf_num <- setNames(cts$conf_level, cts$mg_cluster_key_num)
+map_delta_num <- setNames(cts$delta_z, cts$mg_cluster_key_num)
+map_state_num <- setNames(cts$assigned_state, cts$mg_cluster_key_num)
+
+cell_clusters <- as.character(obj$mg_cluster)
+cell_clusters_num <- sub("^(?:g|G|MG|mg)?", "", cell_clusters)
+
+conf_vec <- map_conf_primary[cell_clusters]
+delta_vec <- map_delta_primary[cell_clusters]
+state_vec <- map_state_primary[cell_clusters]
+
+missing_idx <- which(is.na(conf_vec) | is.na(delta_vec) | is.na(state_vec))
+if (length(missing_idx) > 0) {
+  conf_vec[missing_idx] <- map_conf_num[cell_clusters_num[missing_idx]]
+  delta_vec[missing_idx] <- map_delta_num[cell_clusters_num[missing_idx]]
+  state_vec[missing_idx] <- map_state_num[cell_clusters_num[missing_idx]]
+}
+
+conf_vec[is.na(conf_vec)] <- NA_character_
+delta_vec[is.na(delta_vec)] <- NA_real_
+state_vec[is.na(state_vec)] <- NA_character_
+
+stopifnot(length(conf_vec) == nrow(obj@meta.data))
+stopifnot(length(delta_vec) == nrow(obj@meta.data))
+stopifnot(length(state_vec) == nrow(obj@meta.data))
+
+# assign into metadata (use @meta.data directly to avoid Seurat $ assignment edge cases)
+obj@meta.data$MG_STATE_assigned   <- as.character(state_vec)
+obj@meta.data$MG_STATE_confidence <- as.character(conf_vec)
+obj@meta.data$MG_STATE_delta_z    <- as.numeric(delta_vec)
+obj@meta.data$MG_STATE_note       <- ifelse(is.na(obj@meta.data$MG_STATE_assigned), "unassigned", NA_character_)
+
+# sync $ accessor
+obj$MG_STATE_assigned <- obj@meta.data$MG_STATE_assigned
+obj$MG_STATE_confidence <- obj@meta.data$MG_STATE_confidence
+obj$MG_STATE_delta_z <- obj@meta.data$MG_STATE_delta_z
+obj$MG_STATE_note <- obj@meta.data$MG_STATE_note
+
+log_msg("Per-cell MG_STATE fields added to object metadata.")
+
+# --------- 6. Build sample-level manifest & sample x cluster/state matrices ----------
+meta_df <- obj@meta.data %>% as.data.frame() %>% tibble::rownames_to_column("cell_barcode")
+
+sample_summary <- meta_df %>%
+  group_by(sample_id) %>%
+  summarise(
+    n_microglia_total = n(),
+    pct_AA_in_sample = 100 * mean(genotype == "AA"),
+    pct_GG_in_sample = 100 * mean(genotype == "GG"),
+    .groups = "drop"
+  )
+
+sample_x_cluster_counts <- meta_df %>%
+  count(sample_id, mg_cluster) %>%
+  pivot_wider(names_from = mg_cluster, values_from = n, values_fill = 0) %>%
+  arrange(sample_id)
+
+sample_x_state_counts <- meta_df %>%
+  mutate(MG_STATE_assigned = ifelse(is.na(MG_STATE_assigned), "Unassigned", MG_STATE_assigned)) %>%
+  count(sample_id, MG_STATE_assigned) %>%
+  pivot_wider(names_from = MG_STATE_assigned, values_from = n, values_fill = 0) %>%
+  arrange(sample_id)
+
+sample_meta_one <- meta_df %>%
+  group_by(sample_id) %>%
+  summarise(
+    batch = first(batch),
+    genotype = first(genotype),
+    .groups = "drop"
+  )
+
+sample_manifest <- sample_meta_one %>%
+  left_join(sample_summary, by = "sample_id") %>%
+  left_join(sample_x_cluster_counts, by = "sample_id") %>%
+  left_join(sample_x_state_counts, by = "sample_id")
+
+fn_sample_manifest <- file.path(outdir, "sample_manifest.csv")
+fn_sample_x_cluster <- file.path(outdir, "sample_x_cluster_counts.csv")
+fn_sample_x_state <- file.path(outdir, "sample_x_state_counts.csv")
+
+write_csv(sample_manifest, fn_sample_manifest)
+write_csv(sample_x_cluster_counts, fn_sample_x_cluster)
+write_csv(sample_x_state_counts, fn_sample_x_state)
+
+log_msg("Wrote sample manifest and count matrices:\n - ", fn_sample_manifest, "\n - ", fn_sample_x_cluster, "\n - ", fn_sample_x_state)
+
+# --------- 7. Eligibility decisions for sample×unit ----------
+min_eligible <- 10
+min_good <- 20
+
+wide_to_long <- function(wide_df, unit_name = "unit") {
+  wide_df %>%
+    pivot_longer(-sample_id, names_to = unit_name, values_to = "n_cells")
+}
+
+sample_cluster_long <- wide_to_long(sample_x_cluster_counts, unit_name = "mg_cluster") %>%
+  mutate(unit_type = "cluster",
+         eligibility = case_when(
+           n_cells >= min_good ~ "good",
+           n_cells >= min_eligible ~ "eligible",
+           TRUE ~ "too_few"
+         ))
+
+sample_state_long <- wide_to_long(sample_x_state_counts, unit_name = "MG_STATE_assigned") %>%
+  mutate(unit_type = "state",
+         eligibility = case_when(
+           n_cells >= min_good ~ "good",
+           n_cells >= min_eligible ~ "eligible",
+           TRUE ~ "too_few"
+         ))
+
+sample_unit_eligibility <- bind_rows(sample_cluster_long, sample_state_long) %>%
+  arrange(unit_type, sample_id, desc(n_cells))
+
+fn_sample_unit_elig <- file.path(outdir, "sample_unit_eligibility.csv")
+write_csv(sample_unit_eligibility, fn_sample_unit_elig)
+log_msg("Wrote sample_unit_eligibility: ", fn_sample_unit_elig)
+
+# --------- 8. Identify low-representation units & sample-driven clusters ----------
+min_eligible <- 10
+
+cluster_sample_geno_counts <- meta_df %>%
+  count(mg_cluster, sample_id, genotype, name = "n_cells") %>%
+  mutate(is_eligible = n_cells >= min_eligible) %>%
+  group_by(mg_cluster, genotype) %>%
+  summarise(n_samples_eligible = sum(is_eligible), .groups = "drop")
+
+clusters_few_samples <- cluster_sample_geno_counts %>%
+  filter(n_samples_eligible < 3) %>%
+  arrange(mg_cluster, genotype)
+
+state_sample_geno_counts <- meta_df %>%
+  mutate(MG_STATE_assigned = ifelse(is.na(MG_STATE_assigned), "Unassigned", MG_STATE_assigned)) %>%
+  count(MG_STATE_assigned, sample_id, genotype, name = "n_cells") %>%
+  mutate(is_eligible = n_cells >= min_eligible) %>%
+  group_by(MG_STATE_assigned, genotype) %>%
+  summarise(n_samples_eligible = sum(is_eligible), .groups = "drop")
+
+states_few_samples <- state_sample_geno_counts %>%
+  filter(n_samples_eligible < 3) %>%
+  arrange(MG_STATE_assigned, genotype)
+
+cluster_sample_frac <- meta_df %>%
+  count(mg_cluster, sample_id, name = "n_cells") %>%
+  group_by(mg_cluster) %>%
+  mutate(total_cells = sum(n_cells), frac = n_cells / total_cells) %>%
+  ungroup()
+
+sample_driven_clusters <- cluster_sample_frac %>%
+  filter(frac > 0.80) %>%
+  arrange(desc(frac))
+
+fn_clusters_few_samples <- file.path(outdir, "clusters_few_samples_per_genotype.csv")
+fn_states_few_samples   <- file.path(outdir, "states_few_samples_per_genotype.csv")
+fn_sample_driven        <- file.path(outdir, "clusters_sample_driven.csv")
+
+write_csv(clusters_few_samples, fn_clusters_few_samples)
+write_csv(states_few_samples, fn_states_few_samples)
+write_csv(sample_driven_clusters, fn_sample_driven)
+
+log_msg("Wrote diagnostics:\n - ", fn_clusters_few_samples, "\n - ", fn_states_few_samples, "\n - ", fn_sample_driven)
+
+# --------- 9. Export per_cell_metadata.csv (canonical) ----------
+meta_out <- obj@meta.data %>% as.data.frame() %>% tibble::rownames_to_column(var = "cell_barcode")
+scoreV2_cols <- grep("^scoreV2_", colnames(meta_out), value = TRUE)
+
+percell_cols <- c(
+  "cell_barcode",
+  "sample_id",
+  "mg_cluster",
+  "MG_STATE_assigned",
+  "MG_STATE_confidence",
+  "MG_STATE_delta_z",
+  "genotype",
+  "batch",
+  "nCount_RNA",
+  "percent.mt",
+  scoreV2_cols
+)
+
+existing_cols <- intersect(percell_cols, colnames(meta_out))
+missing_cols  <- setdiff(percell_cols, colnames(meta_out))
+if (length(missing_cols) > 0) {
+  log_msg("Note: omitted missing per-cell columns: ", paste(missing_cols, collapse = ", "))
+}
+
+per_cell_metadata <- meta_out %>% select(all_of(existing_cols))
+fn_percell <- file.path(outdir, "per_cell_metadata.csv")
+write_csv(per_cell_metadata, fn_percell)
+log_msg("Wrote per_cell_metadata: ", fn_percell)
+
+# --------- 10. Save final Seurat object ----------
+fn_rds_final <- output_rds
+saveRDS(obj, fn_rds_final, compress = "xz")
+log_msg("Saved final Seurat object to: ", fn_rds_final)
+
+# --------- 11. Final summaries ----------
+log_msg("\nCluster -> MG_STATE summary (first rows):")
+print(head(cluster_to_state_df %>% select(cluster, assigned_state, top_mean_z, delta_z, conf_level, n_cells_in_cluster)))
+
+log_msg("\nPer-cell MG_STATE distribution:")
+print(table(obj@meta.data$MG_STATE_assigned, useNA = "ifany"))
+
+log_msg("\nAll outputs written to: ", normalizePath(outdir))
+                     
+                      
 ########################
 # 13. MANIFEST & DONE
 ########################
