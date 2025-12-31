@@ -1058,8 +1058,302 @@ log_msg("\nPer-cell MG_STATE distribution:")
 print(table(obj@meta.data$MG_STATE_assigned, useNA = "ifany"))
 
 log_msg("\nAll outputs written to: ", normalizePath(outdir))
-                     
-                      
+
+#########################                      
+#VISUALS FOR THE MG_STATES
+##########################
+
+# Generic plotting utilities for state-assigned single-cell datasets
+# Drop into your GitHub script. Requires: Seurat, ggplot2, dplyr, tidyr, readr, patchwork, viridis, cowplot
+# Example usage (after loading mg or meta_df):
+# plot_umap_states(mg, outdir = outdir)
+# plot_sample_state_tile(meta_df, outdir = outdir)
+# plot_sample_composition_stacked(meta_df, outdir = outdir)
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(patchwork)
+library(viridis)
+library(cowplot)
+
+# --------------------------
+# Helper: save PNG (high-res) + PDF (vector)
+# --------------------------
+save_both <- function(plot_obj, fname_base, outdir = ".", width = 6, height = 6, png_dpi = 600) {
+  if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+  png_file <- file.path(outdir, paste0(fname_base, ".png"))
+  pdf_file <- file.path(outdir, paste0(fname_base, ".pdf"))
+  ggsave(png_file, plot = plot_obj, width = width, height = height, dpi = png_dpi, bg = "white")
+  ggsave(pdf_file, plot = plot_obj, width = width, height = height, device = cairo_pdf)
+  message("Wrote: ", png_file, " and ", pdf_file)
+  invisible(list(png = png_file, pdf = pdf_file))
+}
+
+# --------------------------
+# Default palettes (change as desired when calling)
+# --------------------------
+default_state_colors <- c(
+  "Homeostatic" = "#1f78b4",
+  "Activated"   = "#ff7f00",
+  "DAM"         = "#6a3d9a",
+  "Unassigned"  = "#bdbdbd"
+)
+
+default_geno_colors <- c(
+  "AA" = "#D55E00",   # your preferred AA color
+  "GG" = "#0072B2"    # your preferred GG color
+)
+
+# --------------------------
+# Theme: journal-like, no gridlines
+# --------------------------
+theme_journal <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank(),
+      legend.key = element_rect(fill = "transparent", colour = NA),
+      legend.background = element_rect(fill = "transparent"),
+      plot.title = element_text(size = base_size + 2, face = "bold")
+    )
+}
+
+# --------------------------
+# Function: plot_umap_states
+# - input: Seurat object OR a data.frame with UMAP_1/UMAP_2 + state + genotype
+# - main outputs: p_umap_all, p_umap_split (returns a list)
+# --------------------------
+plot_umap_states <- function(x,
+                             state_col = "MG_STATE_assigned",
+                             genotype_col = "genotype",
+                             outdir = ".",
+                             fname_base_all = "UMAP_states_all",
+                             fname_base_split = "UMAP_states_split_by_genotype",
+                             state_colors = default_state_colors,
+                             genotype_colors = default_geno_colors,
+                             point_size = 0.6,
+                             point_alpha = 0.6,
+                             png_dpi = 600,
+                             width_all = 6, height_all = 6,
+                             width_split = 12, height_split = 6) {
+
+  # Build a metadata data.frame with UMAP coords
+  if (inherits(x, "Seurat")) {
+    if (!"umap" %in% names(x@reductions)) stop("Seurat object has no 'umap' reduction.")
+    emb <- Embeddings(x, "umap")
+    meta <- x@meta.data %>% tibble::rownames_to_column("cell_barcode")
+    umap_df <- as.data.frame(emb) %>%
+      tibble::rownames_to_column("cell_barcode") %>%
+      left_join(meta, by = "cell_barcode")
+    # ensure col names
+    colnames(umap_df)[which(colnames(umap_df) == colnames(emb)[1])] <- "UMAP_1"
+    colnames(umap_df)[which(colnames(umap_df) == colnames(emb)[2])] <- "UMAP_2"
+  } else if (is.data.frame(x)) {
+    umap_df <- x
+    if (!all(c("UMAP_1","UMAP_2") %in% colnames(umap_df))) stop("data.frame must contain UMAP_1 and UMAP_2 columns.")
+  } else {
+    stop("x must be a Seurat object or a data.frame with UMAP_1/UMAP_2.")
+  }
+
+  # Prepare columns
+  if (!state_col %in% colnames(umap_df)) {
+    stop(paste0("State column '", state_col, "' not found in metadata."))
+  }
+  if (!genotype_col %in% colnames(umap_df)) {
+    umap_df[[genotype_col]] <- NA_character_
+  }
+
+  umap_df <- umap_df %>%
+    mutate(
+      !!state_col := ifelse(is.na(.data[[state_col]]), "Unassigned", as.character(.data[[state_col]])),
+      !!genotype_col := ifelse(is.na(.data[[genotype_col]]), "NA", as.character(.data[[genotype_col]]))
+    )
+
+  # factor ordering: preserve provided state_colors names order if possible
+  present_states <- unique(umap_df[[state_col]])
+  ordered_states <- intersect(names(state_colors), present_states)
+  other_states <- setdiff(present_states, ordered_states)
+  state_levels <- c(ordered_states, sort(other_states))
+  umap_df[[state_col]] <- factor(umap_df[[state_col]], levels = state_levels)
+
+  # Full UMAP (all cells)
+  p_umap_all <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, color = .data[[state_col]])) +
+    geom_point(size = point_size, alpha = point_alpha, stroke = 0) +
+    scale_color_manual(values = state_colors, na.value = "#bdbdbd") +
+    labs(color = "STATE") +
+    theme_journal() +
+    theme(legend.position = "right")
+
+  # Split by genotype (only genotypes present will be faceted)
+  umap_split_df <- umap_df %>% filter(.data[[genotype_col]] %in% names(genotype_colors))
+  if (nrow(umap_split_df) == 0) {
+    warning("No cells with genotypes matching genotype_colors; split-by-genotype plot will be empty.")
+    p_umap_split <- NULL
+  } else {
+    p_umap_split <- ggplot(umap_split_df, aes(x = UMAP_1, y = UMAP_2, color = .data[[state_col]])) +
+      geom_point(size = point_size, alpha = point_alpha, stroke = 0) +
+      facet_wrap(as.formula(paste("~", genotype_col)), nrow = 1) +
+      scale_color_manual(values = state_colors, na.value = "#bdbdbd") +
+      theme_journal() +
+      theme(strip.text = element_text(size = 12), legend.position = "right")
+  }
+
+  # Save to disk
+  save_both(p_umap_all, fname_base_all, outdir = outdir, width = width_all, height = height_all, png_dpi = png_dpi)
+  if (!is.null(p_umap_split)) {
+    save_both(p_umap_split, fname_base_split, outdir = outdir, width = width_split, height = height_split, png_dpi = png_dpi)
+  }
+
+  invisible(list(umap_all = p_umap_all, umap_split = p_umap_split, umap_df = umap_df))
+}
+
+# --------------------------
+# Function: plot_sample_state_tile
+# - sample_id_col: column name for sample IDs
+# - state_col: column name for state assignment
+# - fills cells by log10(n+1); annotates raw counts (hide zeros)
+# --------------------------
+plot_sample_state_tile <- function(meta_df,
+                                   sample_id_col = "sample_id",
+                                   state_col = "MG_STATE_assigned",
+                                   outdir = ".",
+                                   fname_base = "sample_by_state_tile_log10_counts",
+                                   state_colors = default_state_colors,
+                                   palette_option = "magma",
+                                   png_dpi = 600,
+                                   width = 6.5, height = 6) {
+
+  # validate
+  if (!sample_id_col %in% colnames(meta_df)) stop("sample_id_col not found in meta_df")
+  if (!state_col %in% colnames(meta_df)) stop("state_col not found in meta_df")
+
+  df <- meta_df %>%
+    mutate(!!state_col := ifelse(is.na(.data[[state_col]]), "Unassigned", as.character(.data[[state_col]]))) %>%
+    count(.data[[sample_id_col]], .data[[state_col]], name = "n") %>%
+    tidyr::complete(!!rlang::sym(sample_id_col), !!rlang::sym(state_col),
+                    fill = list(n = 0))
+
+  # compute log10(n+1)
+  df <- df %>%
+    mutate(log10_n1 = log10(n + 1))
+
+  # order samples grouped by genotype if present (attempt to use genotype column if exists)
+  if ("genotype" %in% colnames(meta_df)) {
+    sample_order_df <- meta_df %>%
+      group_by(.data[[sample_id_col]]) %>%
+      summarise(total_cells = n(), genotype = first(genotype), .groups = "drop") %>%
+      arrange(genotype, desc(total_cells))
+    sample_order <- sample_order_df[[sample_id_col]]
+  } else {
+    sample_order <- df %>% group_by(.data[[sample_id_col]]) %>% summarise(total = sum(n)) %>% arrange(desc(total)) %>% pull(!!rlang::sym(sample_id_col))
+  }
+
+  df[[sample_id_col]] <- factor(df[[sample_id_col]], levels = sample_order)
+  state_levels <- unique(df[[state_col]])
+  df[[state_col]] <- factor(df[[state_col]], levels = state_levels)
+
+  p_tile <- ggplot(df, aes_string(x = state_col, y = sample_id_col, fill = "log10_n1")) +
+    geom_tile(color = NA) +
+    geom_text(aes(label = ifelse(n > 0, n, "")), size = 3) +
+    scale_fill_viridis_c(option = palette_option, na.value = "grey90", name = "log10(n+1)") +
+    labs(x = "", y = "") +
+    theme_journal(10) +
+    theme(axis.text.y = element_text(size = 9), axis.text.x = element_text(size = 10), legend.position = "right")
+
+  save_both(p_tile, fname_base, outdir = outdir, width = width, height = height, png_dpi = png_dpi)
+  invisible(list(plot = p_tile, df = df))
+}
+
+# --------------------------
+# Function: plot_sample_composition_stacked
+# - stacked composition per sample (proportion), with genotype strip above (expects 'genotype' column in meta_df)
+# --------------------------
+plot_sample_composition_stacked <- function(meta_df,
+                                           sample_id_col = "sample_id",
+                                           state_col = "MG_STATE_assigned",
+                                           genotype_col = "genotype",
+                                           outdir = ".",
+                                           fname_base = "sample_composition_by_state_stacked",
+                                           state_colors = default_state_colors,
+                                           genotype_colors = default_geno_colors,
+                                           png_dpi = 600,
+                                           width = 10, height = 5) {
+  # validate
+  if (!sample_id_col %in% colnames(meta_df)) stop("sample_id_col not found in meta_df")
+  if (!state_col %in% colnames(meta_df)) stop("state_col not found in meta_df")
+  if (!genotype_col %in% colnames(meta_df)) stop("genotype_col not found in meta_df")
+
+  df <- meta_df %>%
+    mutate(!!state_col := ifelse(is.na(.data[[state_col]]), "Unassigned", as.character(.data[[state_col]])),
+           !!genotype_col := ifelse(is.na(.data[[genotype_col]]), "NA", as.character(.data[[genotype_col]]))) %>%
+    group_by(.data[[sample_id_col]], .data[[genotype_col]], .data[[state_col]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(.data[[sample_id_col]]) %>%
+    mutate(prop = n / sum(n)) %>%
+    ungroup()
+
+  # Order samples by genotype blocks; within genotype by Homeostatic proportion if present
+  sample_order_df <- df %>%
+    group_by(.data[[sample_id_col]]) %>%
+    summarise(total = sum(n), genotype = first(.data[[genotype_col]]), .groups = "drop")
+
+  homeo_df <- df %>% filter(.data[[state_col]] == "Homeostatic") %>% select(.data[[sample_id_col]], prop) %>% rename(homeo_prop = prop)
+  sample_order2 <- sample_order_df %>%
+    left_join(homeo_df, by = sample_id_col) %>%
+    arrange(genotype, desc(homeo_prop)) %>%
+    pull(!!rlang::sym(sample_id_col))
+
+  # ensure ordering includes all samples
+  sample_order2 <- unique(c(sample_order2, sample_order_df[[sample_id_col]]))
+
+  df[[sample_id_col]] <- factor(df[[sample_id_col]], levels = sample_order2)
+  df[[state_col]] <- factor(df[[state_col]], levels = unique(df[[state_col]]))
+
+  # Stacked bar (proportions)
+  p_bar <- ggplot(df, aes_string(x = sample_id_col, y = "prop", fill = state_col)) +
+    geom_bar(stat = "identity", position = "fill", width = 0.8, color = NA) +
+    scale_fill_manual(values = state_colors) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(x = "", y = "Proportion", fill = "STATE") +
+    theme_journal(10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9), legend.position = "right")
+
+  # genotype strip (top)
+  sample_geno_df <- sample_order_df %>%
+    select(all_of(sample_id_col), genotype) %>%
+    mutate(!!sample_id_col := factor(!!rlang::sym(sample_id_col), levels = sample_order2),
+           genotype = factor(genotype, levels = names(genotype_colors)))
+
+  # ensure genotype_colors only contains keys present in sample_geno_df
+  present_genos <- intersect(names(genotype_colors), unique(as.character(sample_geno_df$genotype)))
+  geno_palette <- genotype_colors[present_genos]
+
+  p_geno_strip <- ggplot(sample_geno_df, aes_string(x = sample_id_col, y = 1, fill = "genotype")) +
+    geom_tile() +
+    scale_fill_manual(values = geno_palette, na.value = "#999999") +
+    theme_void() +
+    theme(legend.position = "none")
+
+  combined <- p_geno_strip + p_bar + plot_layout(ncol = 1, heights = c(0.07, 0.93))
+
+  save_both(combined, fname_base, outdir = outdir, width = width, height = height, png_dpi = png_dpi)
+  invisible(list(plot = combined, df = df))
+}
+
+# --------------------------
+# End of utilities
+# --------------------------
+# Example wrapper (uncomment to run in your script):
+# meta_df <- mg@meta.data %>% tibble::rownames_to_column("cell_barcode")
+# plot_umap_states(mg, outdir = outdir)
+# plot_sample_state_tile(meta_df, outdir = outdir)
+# plot_sample_composition_stacked(meta_df, outdir = outdir)
+                                            
 ########################
 # 13. MANIFEST & DONE
 ########################
