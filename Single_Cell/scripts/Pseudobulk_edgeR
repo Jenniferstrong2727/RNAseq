@@ -1,0 +1,1787 @@
+
+
+#!/usr/bin/env Rscript
+# ------------------------------------------------------------------------------
+# Microglia Subclustering + Pseudobulk + DEG + Composition Analysis (Example)
+# ------------------------------------------------------------------------------
+# NOTE:
+# - This script is an EXAMPLE pipeline and should be customized for your dataset.
+# - Object names, markers, output paths, QC thresholds, and metadata columns
+#   (e.g., genotype, sample_id) are all specific to one analysis and are meant
+#   as templates, not strict recommendations.
+#
+# QC / Filtering SETTINGS USED FOR THIS VERSION (upstream, not shown here):
+#   min.cells         = 3
+#   min.features      = 50
+#   mitochondrial     = percent.mt < 15%
+#   ribosomal genes   = removed
+#   lower bound       = nFeature_RNA >= 50 & nCount_RNA >= 200
+#   upper bounds      = none for nFeature_RNA or nCount_RNA
+#   doublets          = removed with scDblFinder
+#   gene filtering    = protein-coding genes only retained
+#
+# Previous QC / filtering strategy (documented elsewhere in GitHub) was stricter.
+#
+# REQUIREMENTS:
+#   - Seurat v4/v5, edgeR, limma, ggplot2, pheatmap, etc.
+#   - A microglia-only Seurat object called `microglia_subset` already created
+#     and filtered according to the above QC.
+#   - Metadata columns:
+#       microglia_subset$genotype   (e.g. "G/G", "A/A")
+#       microglia_subset$sample_id  (unique per sample)
+#
+# Customize:
+#   - out_dir (output folder)
+#   - marker lists
+#   - module definitions
+#   - genotypes, cluster column name, etc.
+# ------------------------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(edgeR)
+  library(limma)
+  library(ggplot2)
+  library(ggrepel)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(scales)
+  library(effsize)
+  library(grid)
+})
+
+# ------------------------------------------------------------------------------
+# USER CONFIGURATION
+# ------------------------------------------------------------------------------
+
+# Output directory (customize for your project)
+out_dir <- file.path(getwd(), "microglia_analysis_PC8_res0.1")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Name of final cluster column to use throughout
+cluster_col_final <- "micro_pc8_res0.1"
+
+# Genotype labels (standardization)
+genotype_levels <- c("G/G", "A/A")
+
+# ------------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# ------------------------------------------------------------------------------
+
+# Robust assay accessor (for Seurat v4/v5; prefers counts, then data)
+get_assay_mat <- function(seurat_obj,
+                          assay = NULL,
+                          prefer = c("counts", "data")) {
+  if (is.null(assay)) {
+    assays_present <- Seurat::Assays(seurat_obj)
+    assay <- if ("RNA" %in% assays_present) {
+      "RNA"
+    } else if ("SCT" %in% assays_present) {
+      "SCT"
+    } else {
+      DefaultAssay(seurat_obj)
+    }
+  }
+  for (lay in prefer) {
+    mat <- tryCatch({
+      GetAssayData(seurat_obj, assay = assay, layer = lay)
+    }, error = function(e1) {
+      tryCatch(GetAssayData(seurat_obj, assay = assay, slot = lay),
+               error = function(e2) NULL)
+    })
+    if (!is.null(mat)) {
+      if (!inherits(mat, "dgCMatrix")) mat <- as(mat, "dgCMatrix")
+      mat@x <- as.numeric(mat@x)
+      return(mat)
+    }
+  }
+  stop("No usable assay layer/slot found for assay ", assay,
+       " (tried: ", paste(prefer, collapse = ", "), ").")
+}
+
+# Case-insensitive gene mapping
+map_genes_ci <- function(req, available) {
+  avail_up <- toupper(available)
+  vapply(req, function(g) {
+    i <- which(avail_up == toupper(g))
+    if (length(i) >= 1) available[i[1]] else NA_character_
+  }, FUN.VALUE = character(1))
+}
+
+# ------------------------------------------------------------------------------
+# 1. PCA on microglia_subset + variance explained
+# ------------------------------------------------------------------------------
+
+if ("integrated" %in% Assays(microglia_subset)) {
+  DefaultAssay(microglia_subset) <- "SCT"
+} else {
+  DefaultAssay(microglia_subset) <- "RNA"
+}
+
+# Recompute HVGs within the microglia subset (optional)
+microglia_subset <- FindVariableFeatures(
+  microglia_subset,
+  selection.method = "vst",
+  nfeatures = 3000
+)
+
+# Scale data
+microglia_subset <- ScaleData(
+  microglia_subset,
+  features = VariableFeatures(microglia_subset),
+  verbose = FALSE
+)
+
+# Run PCA
+microglia_subset <- RunPCA(
+  microglia_subset,
+  features = VariableFeatures(microglia_subset),
+  npcs = 50,
+  verbose = FALSE
+)
+
+# Elbow plot (standard Seurat)
+png(file.path(out_dir, "PCA_elbowPlot.png"), width = 6, height = 4, units = "in", res = 300)
+print(ElbowPlot(microglia_subset, ndims = 50))
+dev.off()
+
+# Custom variance explained plots
+pca_stdev <- microglia_subset[["pca"]]@stdev
+pct_var   <- (pca_stdev^2) / sum(pca_stdev^2) * 100
+cum_var   <- cumsum(pct_var)
+
+pc_df <- data.frame(
+  PC      = 1:length(pct_var),
+  pct_var = pct_var,
+  cum_var = cum_var
+)
+
+p_var_full <- ggplot(pc_df, aes(x = PC)) +
+  geom_bar(aes(y = pct_var), stat = "identity") +
+  geom_line(aes(y = cum_var), linewidth = 0.7) +
+  geom_point(aes(y = cum_var), size = 1.5) +
+  ylab("% variance explained") +
+  xlab("Principal Component") +
+  theme_classic()
+
+p_var_30 <- ggplot(subset(pc_df, PC <= 30), aes(x = PC)) +
+  geom_bar(aes(y = pct_var), stat = "identity") +
+  geom_line(aes(y = cum_var), linewidth = 0.7) +
+  geom_point(aes(y = cum_var), size = 1.5) +
+  ylab("% variance explained") +
+  xlab("Principal Component") +
+  theme_classic()
+
+ggsave(file.path(out_dir, "PCA_variance_allPCs.png"), p_var_full, width = 6, height = 4, dpi = 300)
+ggsave(file.path(out_dir, "PCA_variance_first30PCs.png"), p_var_30, width = 6, height = 4, dpi = 300)
+
+message("PCs for 75% / 80% / 85% variance: ")
+message("  >=75%: ", which(cum_var >= 75)[1])
+message("  >=80%: ", which(cum_var >= 80)[1])
+message("  >=85%: ", which(cum_var >= 85)[1])
+
+# ------------------------------------------------------------------------------
+# 2. PC / resolution sweep (UMAP) & final clustering choice
+# ------------------------------------------------------------------------------
+
+umap_sweep_dir <- file.path(out_dir, "microglia_umap_pc_res_sweep")
+dir.create(umap_sweep_dir, showWarnings = FALSE, recursive = TRUE)
+
+pcs_to_test <- c(8, 10)
+res_to_test <- c(0.1, 0.2)
+
+for (pc in pcs_to_test) {
+  for (res in res_to_test) {
+    micro_tmp <- microglia_subset
+    micro_tmp <- FindNeighbors(micro_tmp, dims = 1:pc)
+    micro_tmp <- FindClusters(micro_tmp, resolution = res)
+    micro_tmp <- RunUMAP(micro_tmp, dims = 1:pc)
+    
+    p <- DimPlot(
+      micro_tmp,
+      group.by = "seurat_clusters",
+      label = TRUE,
+      repel = TRUE
+    ) +
+      ggtitle(paste0("Microglia | PC ", pc, " | res ", res)) +
+      theme_classic(base_size = 14)
+    
+    fname <- paste0("UMAP_microglia_PC", pc, "_res", res, ".png")
+    ggsave(
+      filename = file.path(umap_sweep_dir, fname),
+      plot     = p,
+      width    = 6,
+      height   = 5,
+      dpi      = 300
+    )
+  }
+}
+
+# Example: lock in PC = 8, res = 0.1 as final clustering (customize if needed)
+DefaultAssay(microglia_subset) <- "SCT"
+
+microglia_subset <- RunPCA(microglia_subset, npcs = 8, verbose = FALSE)
+use_pcs <- 1:8
+res_val <- 0.1
+
+microglia_subset <- FindNeighbors(microglia_subset, dims = use_pcs)
+microglia_subset <- FindClusters(microglia_subset, resolution = res_val)
+microglia_subset <- RunUMAP(microglia_subset, dims = use_pcs)
+
+microglia_subset[[cluster_col_final]] <- Idents(microglia_subset)
+Idents(microglia_subset) <- cluster_col_final
+
+# ------------------------------------------------------------------------------
+# 3. UMAP visualizations: clusters, genotype, sample, split-by-genotype
+# ------------------------------------------------------------------------------
+
+umap_theme <- theme_classic(base_size = 16) +
+  theme(
+    axis.title   = element_text(size = 16),
+    axis.text    = element_text(size = 14),
+    legend.title = element_text(size = 16),
+    legend.text  = element_text(size = 14)
+  )
+
+umap_dir <- file.path(out_dir, "UMAP_microglia_PC8_res0.1")
+dir.create(umap_dir, showWarnings = FALSE, recursive = TRUE)
+
+# By cluster
+p_clusters <- DimPlot(
+  microglia_subset,
+  reduction = "umap",
+  group.by  = cluster_col_final,
+  label     = TRUE,
+  repel     = TRUE
+) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  umap_theme
+
+ggsave(file.path(umap_dir, "UMAP_clusters.png"), p_clusters, width = 6, height = 5, dpi = 300)
+ggsave(file.path(umap_dir, "UMAP_clusters.pdf"), p_clusters, width = 6, height = 5, dpi = 300)
+
+# By genotype
+p_genotype <- DimPlot(
+  microglia_subset,
+  reduction = "umap",
+  group.by  = "genotype"
+) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  umap_theme
+
+ggsave(file.path(umap_dir, "UMAP_genotype.png"), p_genotype, width = 6, height = 5, dpi = 300)
+ggsave(file.path(umap_dir, "UMAP_genotype.pdf"), p_genotype, width = 6, height = 5, dpi = 300)
+
+# By sample_id
+p_sample <- DimPlot(
+  microglia_subset,
+  reduction = "umap",
+  group.by  = "sample_id"
+) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  umap_theme
+
+ggsave(file.path(umap_dir, "UMAP_sample.png"), p_sample, width = 6, height = 5, dpi = 300)
+ggsave(file.path(umap_dir, "UMAP_sample.pdf"), p_sample, width = 6, height = 5, dpi = 300)
+
+# Split-by-genotype, colored by cluster
+split_dir <- file.path(out_dir, "UMAP_microglia_PC8_res0.1_splitByGenotype")
+dir.create(split_dir, showWarnings = FALSE, recursive = TRUE)
+
+split_umap_theme <- theme_classic(base_size = 16) +
+  theme(
+    axis.title   = element_text(size = 16),
+    axis.text    = element_text(size = 14),
+    legend.title = element_text(size = 14),
+    legend.text  = element_text(size = 12),
+    strip.text   = element_text(size = 16, face = "bold")
+  )
+
+p_split_genotype <- DimPlot(
+  microglia_subset,
+  reduction = "umap",
+  group.by  = cluster_col_final,
+  split.by  = "genotype",
+  label     = FALSE
+) +
+  labs(
+    x = "UMAP_1",
+    y = "UMAP_2",
+    color = "Microglia cluster"
+  ) +
+  split_umap_theme
+
+ggsave(
+  filename = file.path(split_dir, "UMAP_splitByGenotype.png"),
+  plot     = p_split_genotype,
+  width    = 10,
+  height   = 4,
+  dpi      = 600
+)
+ggsave(
+  filename = file.path(split_dir, "UMAP_splitByGenotype.pdf"),
+  plot     = p_split_genotype,
+  width    = 10,
+  height   = 4,
+  dpi      = 600
+)
+
+# ------------------------------------------------------------------------------
+# 4. Feature plots for canonical microglia markers (example markers)
+# ------------------------------------------------------------------------------
+
+DefaultAssay(microglia_subset) <- "SCT"
+
+# Homeostatic / microglia markers
+micro_genes <- c("P2RY12", "TMEM119", "SALL1", "CX3CR1")
+
+feat_theme <- theme_classic(base_size = 14) +
+  theme(
+    axis.title   = element_text(size = 14),
+    axis.text    = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text  = element_text(size = 10)
+  )
+
+feat_dir <- file.path(out_dir, "FeaturePlots_microglia_markers")
+dir.create(feat_dir, showWarnings = FALSE, recursive = TRUE)
+
+p_feats <- FeaturePlot(
+  microglia_subset,
+  features  = micro_genes,
+  reduction = "umap",
+  ncol      = 2
+) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  feat_theme
+
+ggsave(file.path(feat_dir, "FeaturePlot_microglia_markers.png"), p_feats, width = 8, height = 6, dpi = 300)
+ggsave(file.path(feat_dir, "FeaturePlot_microglia_markers.pdf"), p_feats, width = 8, height = 6, dpi = 300)
+
+# DAM markers
+dam_genes <- c("APOE", "TREM2", "GPNMB", "SPP1")
+
+dam_feat_dir <- file.path(out_dir, "FeaturePlots_microglia_DAM_markers")
+dir.create(dam_feat_dir, showWarnings = FALSE, recursive = TRUE)
+
+p_dam <- FeaturePlot(
+  microglia_subset,
+  features  = dam_genes,
+  reduction = "umap",
+  ncol      = 2
+) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  feat_theme
+
+ggsave(file.path(dam_feat_dir, "FeaturePlot_DAM_markers.png"), p_dam, width = 8, height = 6, dpi = 300)
+ggsave(file.path(dam_feat_dir, "FeaturePlot_DAM_markers.pdf"), p_dam, width = 8, height = 6, dpi = 300)
+
+# ------------------------------------------------------------------------------
+# 5. % Recovery by genotype (example: microglia seeded vs recovered)
+# ------------------------------------------------------------------------------
+
+# This assumes each sample has the same number of microglia seeded.
+# Customize `microglia_seeded` as appropriate for your experiment.
+
+micro_counts <- microglia_subset@meta.data %>%
+  group_by(sample_id, genotype) %>%
+  summarise(
+    microglia_recovered = n(),
+    .groups = "drop"
+  )
+
+df_recovery <- micro_counts %>%
+  mutate(
+    microglia_seeded = 93750,                    # example value
+    percent_recovery = microglia_recovered / microglia_seeded * 100
+  )
+
+# Wilcoxon test and effect size
+wilcox_test <- wilcox.test(percent_recovery ~ genotype, data = df_recovery, exact = FALSE)
+cliff <- cliff.delta(percent_recovery ~ genotype, data = df_recovery)
+
+# Boxplot
+df_recovery <- df_recovery %>%
+  mutate(genotype = factor(genotype, levels = genotype_levels))
+
+gen_colors <- c("G/G" = "#1f78b4", "A/A" = "#d95f02")
+
+p_recovery <- ggplot(df_recovery,
+                     aes(x = genotype, y = percent_recovery, color = genotype)) +
+  geom_boxplot(width = 0.4, outlier.shape = NA, alpha = 0.2, linewidth = 0.9) +
+  geom_jitter(width = 0.08, size = 3.5, stroke = 0, alpha = 0.9) +
+  scale_color_manual(values = gen_colors) +
+  ylab("% Recovery") +
+  xlab("") +
+  theme_classic(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.title.y    = element_text(size = 16),
+    axis.text.x     = element_text(size = 14),
+    axis.text.y     = element_text(size = 14)
+  )
+
+p_recovery_annot <- p_recovery +
+  annotate(
+    "text",
+    x = 1.5, y = max(df_recovery$percent_recovery) * 1.05,
+    label = paste0("Cliff's δ = ", round(cliff$estimate, 2),
+                   "\nWilcoxon p = ", signif(wilcox_test$p.value, 2)),
+    size = 4
+  )
+
+ggsave(file.path(out_dir, "microglia_recovery_box_jitter.png"),
+       plot = p_recovery_annot, width = 4, height = 4.5, dpi = 600)
+ggsave(file.path(out_dir, "microglia_recovery_box_jitter.pdf"),
+       plot = p_recovery_annot, width = 4, height = 4.5, dpi = 600)
+
+# ------------------------------------------------------------------------------
+# 6. Cluster composition by genotype and sample (stacked barplots)
+# ------------------------------------------------------------------------------
+
+cluster_dist_dir <- file.path(out_dir, "Microglia_cluster_composition")
+dir.create(cluster_dist_dir, showWarnings = FALSE, recursive = TRUE)
+
+micro_meta <- microglia_subset@meta.data %>%
+  dplyr::select(all_of(cluster_col_final), genotype, sample_id) %>%
+  mutate(
+    cluster = as.character(.data[[cluster_col_final]]),
+    cluster = factor(cluster, levels = sort(unique(as.numeric(cluster))))
+  )
+
+bar_theme <- theme_classic(base_size = 14) +
+  theme(
+    axis.title   = element_text(size = 14),
+    axis.text    = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text  = element_text(size = 10)
+  )
+
+# Within-cluster genotype proportions
+df_geno <- micro_meta %>%
+  group_by(cluster, genotype) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+p_geno <- ggplot(df_geno, aes(x = cluster, y = prop, fill = genotype)) +
+  geom_col(color = "black", width = 0.9) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = gen_colors) +
+  labs(
+    x = "Microglia cluster",
+    y = "Within-cluster genotype proportion",
+    fill = "Genotype"
+  ) +
+  bar_theme
+
+ggsave(file.path(cluster_dist_dir, "cluster_pct_by_genotype.png"),
+       p_geno, width = 6, height = 4, dpi = 600)
+ggsave(file.path(cluster_dist_dir, "cluster_pct_by_genotype.pdf"),
+       p_geno, width = 6, height = 4, dpi = 600)
+
+# Within-cluster sample proportions
+samples <- sort(unique(micro_meta$sample_id))
+n_samp  <- length(samples)
+
+sample_colors <- setNames(
+  rep(RColorBrewer::brewer.pal(min(max(n_samp, 3), 12), "Set3"),
+      length.out = n_samp),
+  samples
+)
+
+df_samp <- micro_meta %>%
+  group_by(cluster, sample_id) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+p_samp <- ggplot(df_samp, aes(x = cluster, y = prop, fill = sample_id)) +
+  geom_col(color = "black", width = 0.9) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = sample_colors) +
+  labs(
+    x = "Microglia cluster",
+    y = "Within-cluster sample proportion",
+    fill = "Sample"
+  ) +
+  bar_theme
+
+ggsave(file.path(cluster_dist_dir, "cluster_pct_by_sample.png"),
+       p_samp, width = 8, height = 4, dpi = 600)
+ggsave(file.path(cluster_dist_dir, "cluster_pct_by_sample.pdf"),
+       p_samp, width = 8, height = 4, dpi = 600)
+
+# ------------------------------------------------------------------------------
+# 7. Pseudobulk (genes x samples) + edgeR DGEList for global AA vs GG
+# ------------------------------------------------------------------------------
+
+mic <- microglia_subset
+
+meta_cols <- colnames(mic@meta.data)
+stopifnot("sample_id" %in% meta_cols, "genotype" %in% meta_cols, cluster_col_final %in% meta_cols)
+
+sample_col  <- "sample_id"
+cluster_col <- cluster_col_final
+
+counts_mat <- get_assay_mat(mic, assay = NULL, prefer = c("counts", "data"))
+message("Counts matrix dims: ", paste(dim(counts_mat), collapse = " x "))
+
+samples_present <- sort(unique(mic@meta.data[[sample_col]]))
+message("Samples detected: ", paste(samples_present, collapse = ", "))
+
+pb_list <- lapply(samples_present, function(s) {
+  cells_of_s <- colnames(mic)[mic@meta.data[[sample_col]] == s]
+  if (length(cells_of_s) == 0) {
+    rep(0L, nrow(counts_mat))
+  } else {
+    Matrix::rowSums(counts_mat[, cells_of_s, drop = FALSE])
+  }
+})
+
+pseudobulk_counts <- do.call(cbind, pb_list)
+colnames(pseudobulk_counts) <- samples_present
+rownames(pseudobulk_counts) <- rownames(counts_mat)
+mode(pseudobulk_counts) <- "integer"
+
+pb_out_dir <- file.path(out_dir, "pseudobulk_microglia_PC8_res0.1")
+dir.create(pb_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Sample-level metadata
+sample_meta <- mic@meta.data %>%
+  as.data.frame() %>%
+  group_by(sample = .data[[sample_col]]) %>%
+  summarise(
+    total_cells = n(),
+    genotype    = first(genotype),
+    .groups     = "drop"
+  ) %>%
+  filter(sample %in% samples_present) %>%
+  arrange(match(sample, samples_present))
+
+sample_meta$genotype <- as.character(sample_meta$genotype)
+sample_meta$genotype <- case_when(
+  sample_meta$genotype %in% c("GG", "G/G", "G_G", "G") ~ "GG",
+  sample_meta$genotype %in% c("AA", "A/A", "A_A", "A") ~ "AA",
+  TRUE ~ sample_meta$genotype
+)
+
+dge <- DGEList(counts = pseudobulk_counts)
+
+sample_meta_ordered <- sample_meta %>%
+  arrange(match(sample, colnames(pseudobulk_counts)))
+stopifnot(all(sample_meta_ordered$sample == colnames(pseudobulk_counts)))
+
+dge$samples <- cbind(dge$samples,
+                     sample_meta_ordered %>% select(-sample))
+
+# Save pseudobulk objects
+saveRDS(pseudobulk_counts,
+        file.path(pb_out_dir, "microglia_pseudobulk_counts_genes_by_sample.rds"))
+saveRDS(dge,
+        file.path(pb_out_dir, "microglia_pseudobulk_DGEList.rds"))
+write.csv(as.data.frame(sample_meta_ordered),
+          file = file.path(pb_out_dir, "microglia_pseudobulk_sample_metadata.csv"),
+          row.names = FALSE)
+
+# Global AA vs GG DE (pseudobulk-level)
+sample_meta2 <- sample_meta_ordered
+sample_meta2$genotype <- case_when(
+  sample_meta2$genotype %in% c("GG") ~ "GG",
+  sample_meta2$genotype %in% c("AA") ~ "AA",
+  TRUE ~ sample_meta2$genotype
+)
+
+keep_samples <- sample_meta2$genotype %in% c("GG", "AA")
+sample_meta2 <- sample_meta2[keep_samples, , drop = TRUE]
+pb_global    <- pseudobulk_counts[, keep_samples, drop = FALSE]
+stopifnot(all(colnames(pb_global) == sample_meta2$sample))
+
+dge_global <- DGEList(counts = pb_global)
+sample_meta2$genotype <- factor(sample_meta2$genotype, levels = c("GG", "AA"))
+rownames(sample_meta2) <- sample_meta2$sample
+
+dge_global$samples <- cbind(dge_global$samples,
+                            sample_meta2 %>% select(-sample))
+
+keep_genes <- rowSums(cpm(dge_global) > 1) >= 2
+dge_global <- dge_global[keep_genes, , keep.lib.sizes = FALSE]
+dge_global <- calcNormFactors(dge_global)
+
+design_global <- model.matrix(~ genotype, data = dge_global$samples)
+dge_global <- estimateDisp(dge_global, design_global)
+fit_global <- glmQLFit(dge_global, design_global, robust = TRUE)
+
+stopifnot("genotypeAA" %in% colnames(fit_global$coefficients))
+qlf_global <- glmQLFTest(fit_global, coef = "genotypeAA")
+
+top_global <- topTags(qlf_global, n = nrow(dge_global), adjust.method = "BH")$table
+top_global$gene <- rownames(top_global)
+top_global <- top_global %>%
+  select(gene, logFC, logCPM, PValue, FDR) %>%
+  arrange(desc(logFC))
+
+deg_dir <- file.path(out_dir, "edgeR_global_microglia_PC8_res0.1")
+dir.create(deg_dir, showWarnings = FALSE, recursive = TRUE)
+
+write.csv(top_global,
+          file.path(deg_dir, "global_microglia_AA_vs_GG_by_logFC.csv"),
+          row.names = FALSE)
+saveRDS(list(dge = dge_global, fit = fit_global,
+             qlf = qlf_global, top = top_global),
+        file.path(deg_dir, "global_microglia_edgeR.rds"))
+
+message("Global AA vs GG DE saved to: ",
+        normalizePath(file.path(deg_dir, "global_microglia_AA_vs_GG_by_logFC.csv")))
+
+# ------------------------------------------------------------------------------
+# 8. Cluster vs rest DE for each microglia cluster (pseudobulk per sample)
+# ------------------------------------------------------------------------------
+
+genes      <- rownames(counts_mat)
+samples    <- sort(unique(mic@meta.data[[sample_col]]))
+clusters   <- sort(unique(as.character(mic@meta.data[[cluster_col]])))
+
+make_cluster_rest_pb <- function(clus) {
+  pb_cluster <- matrix(0L, nrow = nrow(counts_mat), ncol = length(samples),
+                       dimnames = list(genes, samples))
+  pb_rest    <- pb_cluster
+  
+  for (i in seq_along(samples)) {
+    s <- samples[i]
+    cells_s <- colnames(mic)[mic@meta.data[[sample_col]] == s]
+    if (length(cells_s) == 0) next
+    
+    clus_mask <- mic@meta.data[cells_s, cluster_col] == clus
+    cells_cluster <- cells_s[clus_mask]
+    cells_rest    <- cells_s[!clus_mask]
+    
+    if (length(cells_cluster) > 0) {
+      pb_cluster[, i] <- Matrix::rowSums(counts_mat[, cells_cluster, drop = FALSE])
+    }
+    if (length(cells_rest) > 0) {
+      pb_rest[, i] <- Matrix::rowSums(counts_mat[, cells_rest, drop = FALSE])
+    }
+  }
+  mode(pb_cluster) <- "integer"
+  mode(pb_rest)    <- "integer"
+  list(cluster = pb_cluster, rest = pb_rest)
+}
+
+cluster_sig_dir <- file.path(out_dir, "edgeR_cluster_vs_rest_PC8_res0.1")
+dir.create(cluster_sig_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (clus in clusters) {
+  message("\n########## Cluster vs rest: ", clus, " ##########")
+  pb <- make_cluster_rest_pb(clus)
+  pb_cluster <- pb$cluster
+  pb_rest    <- pb$rest
+  
+  colnames(pb_cluster) <- paste0(samples, "_cluster")
+  colnames(pb_rest)    <- paste0(samples, "_rest")
+  combined <- cbind(pb_cluster, pb_rest)
+  
+  lib_sizes <- colSums(combined)
+  zero_cols <- names(lib_sizes[lib_sizes == 0])
+  if (length(zero_cols) > 0) {
+    message("  Dropping zero-count columns: ", paste(zero_cols, collapse = ", "))
+    combined <- combined[, setdiff(colnames(combined), zero_cols), drop = FALSE]
+  }
+  if (ncol(combined) < 2) {
+    message("  < 2 columns with counts -> skipping cluster ", clus)
+    next
+  }
+  
+  dge_c <- DGEList(counts = combined)
+  group <- ifelse(grepl("_cluster$", colnames(combined)), "cluster", "rest")
+  group <- factor(group, levels = c("rest", "cluster"))
+  dge_c$samples$group <- group
+  
+  keep <- rowSums(cpm(dge_c) > 1) >= 2
+  dge_c <- dge_c[keep, , keep.lib.sizes = FALSE]
+  if (nrow(dge_c) == 0) {
+    message("  No genes passed CPM filter -> skipping")
+    next
+  }
+  
+  dge_c <- calcNormFactors(dge_c)
+  design <- model.matrix(~ group, data = dge_c$samples)
+  dge_c <- estimateDisp(dge_c, design)
+  fit <- glmQLFit(dge_c, design, robust = TRUE)
+  
+  stopifnot("groupcluster" %in% colnames(fit$coefficients))
+  qlf <- glmQLFTest(fit, coef = "groupcluster")
+  
+  top <- topTags(qlf, n = nrow(dge_c), adjust.method = "BH")$table
+  top$gene <- rownames(top)
+  top <- top %>% select(gene, logFC, logCPM, PValue, FDR) %>% arrange(desc(logFC))
+  
+  out_csv <- file.path(cluster_sig_dir,
+                       paste0("cluster_", clus, "_vs_rest_signature_by_logFC.csv"))
+  out_rds <- file.path(cluster_sig_dir,
+                       paste0("cluster_", clus, "_vs_rest_edgeR.rds"))
+  
+  write.csv(top, out_csv, row.names = FALSE)
+  saveRDS(list(dge = dge_c, fit = fit, qlf = qlf, top = top), out_rds)
+  
+  message("  Saved: ", out_csv)
+}
+
+# Combine all per-cluster CSVs
+csv_files <- list.files(
+  cluster_sig_dir,
+  pattern = "^cluster_.*_vs_rest_signature_by_logFC\\.csv$",
+  full.names = TRUE
+)
+
+all_top <- lapply(csv_files, function(f) {
+  df <- read.csv(f, stringsAsFactors = FALSE)
+  clus <- sub("^cluster_(.*)_vs_rest_signature_by_logFC\\.csv$", "\\1", basename(f))
+  df$cluster <- clus
+  df
+})
+all_top_df <- bind_rows(all_top)
+
+if ("logFC" %in% colnames(all_top_df)) {
+  all_top_df <- all_top_df %>%
+    mutate(
+      logFC  = as.numeric(logFC),
+      cluster = as.character(cluster)
+    ) %>%
+    arrange(as.numeric(cluster), desc(logFC))
+}
+
+combined_csv <- file.path(cluster_sig_dir, "edgeR_cluster_vs_rest_ALL_clusters_by_logFC.csv")
+write.csv(all_top_df, combined_csv, row.names = FALSE)
+message("Combined per-cluster CSV written to: ", normalizePath(combined_csv))
+
+# ------------------------------------------------------------------------------
+# 9. Cluster-vs-rest FDR summaries + filtered microglia marker signatures
+# ------------------------------------------------------------------------------
+
+cluster_fdr_summary <- all_top_df %>%
+  mutate(
+    FDR_0.05 = FDR < 0.05,
+    FDR_0.10 = FDR < 0.10
+  ) %>%
+  group_by(cluster) %>%
+  summarise(
+    n_FDR_0.05 = sum(FDR_0.05, na.rm = TRUE),
+    n_FDR_0.10 = sum(FDR_0.10, na.rm = TRUE),
+    min_FDR    = min(FDR, na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  arrange(as.numeric(as.character(cluster)))
+
+print(cluster_fdr_summary)
+
+# Curated microglia marker list (example; customize)
+microglia_all_markers <- c(
+  "ABCA1","ACSL4","AIF1","AIFM2","APOC1","APOE","ARG1","ATF3","ATF4","ATF6",
+  "ATG5","ATG7","ATM","AXL","BAG3","BECN1","C1Q","C1QA","C1QB","C1QC",
+  "C3","C4A","C4B","CASP1","CCL2","CCL5","CD11b","CD14","CD163","CD206",
+  "CD36","CD40","CD45","CD68","CD74","CD86","CD9","CH25H","CHAC1","CIDEC",
+  "CSF1R","CST7","CTSB","CTSD","CTSL","CX3CR1","CXCL10","DDIT3","DNAJB1","DNAJC6",
+  "EIF2AK3","EIF2S1","ERO1A","FABP5","FCGR3A","FCRLS","G0S2","GAS6","GBA","GBP2",
+  "GPNMB","GPR34","GPX4","GSDMD","GULP1","H2AFX","HERPUD1","HEXB","HLA-DRA","HLA-DRB1",
+  "HMOX1","HSP90AA1","HSP90B1","HSPA1A","HSPA5","HSPA8","HSPB1","HSPH1","IFI27","IFIT1",
+  "IFIT2","IFITM3","IFNA1","IFNB1","IFNGR1","IKBKB","IL10","IL18","IL1B","IL6",
+  "IRF1","IRF7","IRF8","ISG15","ITGAM","ITGAX","ITGB2","LAMP1","LAMP2","LPL",
+  "LRP1","MAP1LC3B","MERTK","MFGE8","MHCII","NFE2L2","NFKB1","NLRP3","NPC1","NPC2",
+  "OASL","OLFML3","P2RX7","P2RY12","P4HB","PDIA3","PDIA4","PLIN2","PPP1R15A","PRDX1",
+  "PROS1","PYCARD","RAD51","RELA","SALL1","SCARB2","SLC7A11","SOAT1","SOD2","SORT1",
+  "SPI1","SPP1","SQSTM1","STAT1","TFEB","TFRC","TGFB1","TMEM119","TNF","TP53",
+  "TRAF2","TREM2","TYRO3","TYROBP","ULK1","XBP1","XRCC1"
+)
+marker_set_upper <- unique(toupper(microglia_all_markers))
+
+cluster_sig_base <- all_top_df %>%
+  mutate(
+    cluster = as.numeric(as.character(cluster)),
+    logFC   = as.numeric(logFC),
+    FDR     = as.numeric(FDR)
+  )
+
+# FDR < 0.05
+cluster_sig_FDR05 <- cluster_sig_base %>%
+  filter(FDR < 0.05) %>%
+  arrange(cluster, desc(logFC))
+out_fdr05 <- file.path(out_dir, "edgeR_cluster_vs_rest_ALL_clusters_FDR_0.05_ordered.csv")
+write.csv(cluster_sig_FDR05, out_fdr05, row.names = FALSE)
+
+# FDR < 0.10
+cluster_sig_FDR10 <- cluster_sig_base %>%
+  filter(FDR < 0.10) %>%
+  arrange(cluster, desc(logFC))
+out_fdr10 <- file.path(out_dir, "edgeR_cluster_vs_rest_ALL_clusters_FDR_0.10_ordered.csv")
+write.csv(cluster_sig_FDR10, out_fdr10, row.names = FALSE)
+
+# Curated microglia markers at FDR < 0.10
+marker_filtered_FDR10 <- all_top_df %>%
+  mutate(
+    gene_upper = toupper(gene),
+    cluster    = as.numeric(as.character(cluster)),
+    logFC      = as.numeric(logFC),
+    FDR        = as.numeric(FDR)
+  ) %>%
+  filter(
+    FDR < 0.10,
+    gene_upper %in% marker_set_upper
+  ) %>%
+  arrange(cluster, desc(logFC)) %>%
+  select(-gene_upper)
+
+out_marker_FDR10 <- file.path(
+  out_dir,
+  "edgeR_cluster_vs_rest_FDR_0.10_microglia_curated_markers.csv"
+)
+write.csv(marker_filtered_FDR10, out_marker_FDR10, row.names = FALSE)
+
+# Curated microglia markers at FDR < 0.05
+marker_filtered_FDR05 <- all_top_df %>%
+  mutate(
+    gene_upper = toupper(gene),
+    cluster    = as.numeric(as.character(cluster)),
+    logFC      = as.numeric(logFC),
+    FDR        = as.numeric(FDR)
+  ) %>%
+  filter(
+    FDR < 0.05,
+    gene_upper %in% marker_set_upper
+  ) %>%
+  arrange(cluster, desc(logFC)) %>%
+  select(-gene_upper)
+
+out_marker_FDR05 <- file.path(
+  out_dir,
+  "edgeR_cluster_vs_rest_FDR_0.05_microglia_curated_markers.csv"
+)
+write.csv(marker_filtered_FDR05, out_marker_FDR05, row.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# 10. Propeller-style abundance analysis (genotype + batch)
+# ------------------------------------------------------------------------------
+
+prop_out_dir <- file.path(out_dir, "propeller_microglia_PC8_res0.1")
+dir.create(prop_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+meta <- mic@meta.data
+meta[[sample_col]]  <- as.character(meta[[sample_col]])
+meta[[cluster_col]] <- as.character(meta[[cluster_col]])
+
+cluster_sample_long <- meta %>%
+  group_by(cluster = .data[[cluster_col]],
+           sample  = .data[[sample_col]]) %>%
+  summarise(cells = n(), .groups = "drop")
+
+samples_present  <- sort(unique(cluster_sample_long$sample))
+clusters_present <- sort(unique(cluster_sample_long$cluster))
+
+prop_mat <- matrix(
+  0L,
+  nrow = length(clusters_present),
+  ncol = length(samples_present),
+  dimnames = list(clusters_present, samples_present)
+)
+
+for (s in samples_present) {
+  tmp <- cluster_sample_long %>% filter(sample == s)
+  if (nrow(tmp) > 0) {
+    prop_mat[as.character(tmp$cluster), s] <- tmp$cells
+  }
+}
+
+per_sample_total <- meta %>%
+  group_by(sample = .data[[sample_col]]) %>%
+  summarise(total_cells = n(), .groups = "drop")
+
+tot_vec <- per_sample_total$total_cells[
+  match(samples_present, per_sample_total$sample)
+]
+
+prop_mat_prop <- sweep(prop_mat, 2, tot_vec, FUN = "/")
+
+sample_meta_prop <- meta %>%
+  select(!!sample_col, genotype) %>%
+  distinct() %>%
+  rename(sample = !!sym(sample_col))
+
+sample_meta_prop$genotype <- as.character(sample_meta_prop$genotype)
+sample_meta_prop$genotype <- case_when(
+  sample_meta_prop$genotype %in% c("GG", "G/G", "G_G", "G") ~ "GG",
+  sample_meta_prop$genotype %in% c("AA", "A/A", "A_A", "A") ~ "AA",
+  TRUE ~ sample_meta_prop$genotype
+)
+
+sample_meta_prop$batch <- if_else(
+  grepl("pilot", sample_meta_prop$sample, ignore.case = TRUE),
+  "pilot", "main"
+)
+
+sample_meta_prop <- sample_meta_prop %>% filter(genotype %in% c("GG", "AA"))
+keep_samples_prop <- intersect(samples_present, sample_meta_prop$sample)
+
+prop_mat_prop <- prop_mat_prop[, keep_samples_prop, drop = FALSE]
+
+sample_meta_prop <- sample_meta_prop %>%
+  filter(sample %in% keep_samples_prop) %>%
+  arrange(match(sample, colnames(prop_mat_prop)))
+
+sample_meta_prop$genotype <- factor(sample_meta_prop$genotype, levels = c("GG", "AA"))
+sample_meta_prop$batch    <- factor(sample_meta_prop$batch, levels = c("main", "pilot"))
+
+trans_prop <- asin(sqrt(prop_mat_prop))
+
+tot_vec2 <- per_sample_total$total_cells[
+  match(colnames(prop_mat_prop), per_sample_total$sample)
+]
+w_vec <- sqrt(as.numeric(tot_vec2))
+weights_mat <- matrix(
+  rep(w_vec, each = nrow(trans_prop)),
+  nrow = nrow(trans_prop),
+  byrow = FALSE,
+  dimnames = dimnames(trans_prop)
+)
+
+design_prop <- model.matrix(~ genotype + batch, data = sample_meta_prop)
+fit_prop <- lmFit(trans_prop, design = design_prop, weights = weights_mat)
+fit_prop <- eBayes(fit_prop)
+
+coef_name <- "genotypeAA"
+stopifnot(coef_name %in% colnames(design_prop))
+coef_idx <- which(colnames(design_prop) == coef_name)
+
+prop_res <- data.frame(
+  cluster = rownames(fit_prop$coefficients),
+  coef    = fit_prop$coefficients[, coef_idx],
+  t       = fit_prop$t[, coef_idx],
+  p.value = fit_prop$p.value[, coef_idx],
+  FDR     = p.adjust(fit_prop$p.value[, coef_idx], method = "BH"),
+  stringsAsFactors = FALSE
+)
+
+prop_df_long <- as.data.frame(t(prop_mat_prop))
+prop_df_long$sample <- rownames(prop_df_long)
+
+prop_df_long <- prop_df_long %>%
+  pivot_longer(
+    cols      = -sample,
+    names_to  = "cluster",
+    values_to = "prop"
+  ) %>%
+  left_join(sample_meta_prop, by = "sample")
+
+summary_tbl <- prop_df_long %>%
+  group_by(cluster, genotype) %>%
+  summarise(
+    mean_prop = mean(prop, na.rm = TRUE),
+    sd_prop   = sd(prop,   na.rm = TRUE),
+    n         = n(),
+    se_prop   = sd_prop / sqrt(pmax(1, n)),
+    .groups   = "drop"
+  ) %>%
+  pivot_wider(
+    names_from  = genotype,
+    values_from = c(mean_prop, sd_prop, se_prop, n),
+    names_sep   = "_"
+  )
+
+res_full_prop <- prop_res %>%
+  left_join(summary_tbl, by = "cluster") %>%
+  mutate(
+    delta_AA_minus_GG = mean_prop_AA - mean_prop_GG
+  ) %>%
+  arrange(as.numeric(as.character(cluster)))
+
+write.csv(res_full_prop,
+          file.path(prop_out_dir, "microglia_propeller_PC8_res0.1_results.csv"),
+          row.names = FALSE)
+
+# Faceted abundance plot
+prop_df_plot <- prop_df_long %>%
+  mutate(
+    cluster_num = as.numeric(as.character(cluster)),
+    cluster = factor(cluster_num, levels = sort(unique(cluster_num))),
+    genotype = factor(genotype, levels = c("GG", "AA"))
+  )
+
+gen_colors <- c("GG" = "#1f78b4", "AA" = "#d95f02")
+shape_map  <- c("main" = 16, "pilot" = 17)
+
+p_abund <- ggplot(
+  prop_df_plot,
+  aes(x = genotype, y = prop, color = genotype, shape = batch)
+) +
+  geom_jitter(
+    position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.4),
+    size = 3,
+    alpha = 0.95
+  ) +
+  stat_summary(
+    fun.data = function(x) {
+      y  <- mean(x, na.rm = TRUE)
+      se <- sd(x, na.rm = TRUE) / sqrt(max(1, length(na.omit(x))))
+      data.frame(y = y, ymin = y - se, ymax = y + se)
+    },
+    geom = "errorbar",
+    width = 0.12,
+    color = "black",
+    position = position_dodge(width = 0.4)
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 23,
+    size = 3.5,
+    fill = "black",
+    color = "black",
+    position = position_dodge(width = 0.4)
+  ) +
+  scale_color_manual(values = gen_colors, name = "Genotype") +
+  scale_shape_manual(values = shape_map,  name = "Batch") +
+  facet_wrap(~ cluster, nrow = 1, scales = "fixed") +
+  labs(x = "Genotype", y = "Proportion (per-sample)", title = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    panel.grid   = element_blank(),
+    axis.title   = element_text(size = 14),
+    axis.text    = element_text(size = 12),
+    strip.text   = element_text(size = 13),
+    legend.title = element_text(size = 12),
+    legend.text  = element_text(size = 11)
+  )
+
+nclus  <- length(levels(prop_df_plot$cluster))
+fig_w  <- max(8, 2.0 * nclus)
+fig_h  <- 3.4
+
+ggsave(
+  file.path(prop_out_dir, "microglia_propeller_abundance_facets.png"),
+  p_abund, width = fig_w, height = fig_h, dpi = 600
+)
+ggsave(
+  file.path(prop_out_dir, "microglia_propeller_abundance_facets.pdf"),
+  p_abund, width = fig_w, height = fig_h
+)
+
+# ------------------------------------------------------------------------------
+# 11. Microglia marker modules + heatmap (z-scored avg per cluster)
+# ------------------------------------------------------------------------------
+
+microglia_marker_states <- list(
+  Homeostatic = c(
+    "GPR34", "CSF1R", "P2RX7", "P2RY12", "SALL1", "TMEM119", "CX3CR1"
+  ),
+  Activated = c(
+    "CD68","CD14","ITGB2","CD86","CD74","ITGAM","HLA-DRA","CD40"
+  ),
+  DAM = c(
+    "SPP1","APOE","TYROBP","GPNMB","TREM2","CD9","LPL","CST7"
+  )
+)
+
+heat_out_dir <- file.path(out_dir, "microglia_module_heatmaps_PC8_res0.1")
+dir.create(heat_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+module_list     <- microglia_marker_states
+requested_genes <- unique(unlist(module_list))
+
+assays_present <- Assays(mic)
+assay_choice <- if ("SCT" %in% assays_present) "SCT" else if ("RNA" %in% assays_present) "RNA" else DefaultAssay(mic)
+
+expr_mat <- get_assay_mat(mic, assay = assay_choice, prefer = c("data", "counts"))
+
+genes_mapped <- unique(na.omit(
+  map_genes_ci(requested_genes, rownames(expr_mat))
+))
+plot_genes   <- genes_mapped
+
+if (length(plot_genes) == 0) {
+  stop("None of the requested microglia markers were found in the assay matrix.")
+}
+
+meta <- mic@meta.data
+clusters_used <- sort(unique(as.character(meta[[cluster_col]])))
+cells_by_cluster <- split(rownames(meta), as.character(meta[[cluster_col]]))
+
+avg_mat <- matrix(
+  0,
+  nrow = length(plot_genes),
+  ncol = length(clusters_used),
+  dimnames = list(plot_genes, clusters_used)
+)
+
+for (cl in clusters_used) {
+  cells_cl <- intersect(cells_by_cluster[[cl]], colnames(expr_mat))
+  if (length(cells_cl) == 0) next
+  sub_expr <- expr_mat[plot_genes, cells_cl, drop = FALSE]
+  avg_mat[, cl] <- rowMeans(as.matrix(sub_expr), na.rm = TRUE)
+}
+
+z_mat <- t(apply(avg_mat, 1, function(x) {
+  if (all(is.na(x)) || sd(x, na.rm = TRUE) == 0) {
+    rep(0, length(x))
+  } else {
+    (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+  }
+}))
+rownames(z_mat) <- rownames(avg_mat)
+colnames(z_mat) <- colnames(avg_mat)
+
+module_map <- sapply(rownames(z_mat), function(g) {
+  gu <- toupper(g)
+  if (gu %in% toupper(module_list$Homeostatic)) return("Homeostatic")
+  if (gu %in% toupper(module_list$Activated))   return("Activated")
+  if (gu %in% toupper(module_list$DAM))        return("DAM")
+  "Other"
+})
+
+module_order <- c("Homeostatic", "Activated", "DAM", "Other")
+
+row_order <- order(
+  factor(module_map, levels = module_order),
+  -rowSums(avg_mat, na.rm = TRUE)
+)
+
+z_mat_ord  <- z_mat[row_order, , drop = FALSE]
+module_ord <- module_map[row_order]
+gaps_row   <- which(diff(as.integer(factor(module_ord, levels = module_order))) != 0)
+
+max_abs <- max(abs(z_mat_ord), na.rm = TRUE)
+if (!is.finite(max_abs) || max_abs == 0) max_abs <- 1
+
+heat_colors <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(101)
+breaks_seq  <- seq(-max_abs, max_abs, length.out = length(heat_colors) + 1)
+
+pt <- pheatmap(
+  z_mat_ord,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  color        = heat_colors,
+  breaks       = breaks_seq,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  border_color  = NA,
+  gaps_row      = gaps_row,
+  fontsize      = 11,
+  fontsize_row  = 10,
+  fontsize_col  = 12,
+  main          = "Microglia module expression (z-scored average)"
+)
+
+heat_png <- file.path(heat_out_dir, "heatmap_microglia_modules_zscore.png")
+heat_pdf <- file.path(heat_out_dir, "heatmap_microglia_modules_zscore.pdf")
+
+png(filename = heat_png, width = 10, height = max(3, nrow(z_mat_ord) * 0.25 + 1.5),
+    units = "in", res = 300, type = "cairo")
+grid.newpage(); grid.draw(pt$gtable); dev.off()
+
+cairo_pdf(file = heat_pdf, width = 10, height = max(3, nrow(z_mat_ord) * 0.25 + 1.5))
+grid.newpage(); grid.draw(pt$gtable); dev.off()
+
+write.csv(z_mat_ord,
+          file = file.path(heat_out_dir, "zscore_microglia_modules.csv"),
+          row.names = TRUE)
+
+# ------------------------------------------------------------------------------
+# 12. Volcano plots (cluster vs rest) with curated markers labeled (example)
+# ------------------------------------------------------------------------------
+
+volcano_cluster_dir <- file.path(out_dir, "volcano_cluster_vs_rest")
+dir.create(volcano_cluster_dir, showWarnings = FALSE, recursive = TRUE)
+
+plot_cluster_volcano <- function(cluster_id,
+                                 all_top_df,
+                                 out_dir,
+                                 microglia_marker_list,
+                                 logFC_cutoff = 0.25,
+                                 FDR_cutoff   = 0.05,
+                                 title_prefix = "Cluster") {
+  marker_set_upper <- unique(toupper(microglia_marker_list))
+  
+  de <- all_top_df %>%
+    mutate(
+      cluster = as.character(cluster),
+      logFC   = as.numeric(logFC),
+      FDR     = as.numeric(FDR)
+    ) %>%
+    filter(cluster == as.character(cluster_id)) %>%
+    mutate(
+      neg_log10_FDR = -log10(FDR),
+      direction = case_when(
+        FDR < FDR_cutoff & logFC >=  logFC_cutoff ~ "Up",
+        FDR < FDR_cutoff & logFC <= -logFC_cutoff ~ "Down",
+        TRUE                                      ~ "NS"
+      )
+    )
+  
+  volc_cols <- c("NS" = "grey80", "Down" = "#1f78b4", "Up" = "#e31a1c")
+  
+  label_genes <- de %>%
+    mutate(gene_upper = toupper(gene)) %>%
+    filter(direction %in% c("Up", "Down"),
+           gene_upper %in% marker_set_upper) %>%
+    arrange(FDR) %>%
+    distinct(gene, .keep_all = TRUE)
+  
+  p <- ggplot(de, aes(x = logFC, y = neg_log10_FDR, color = direction)) +
+    geom_point(alpha = 0.7, size = 1.4) +
+    scale_color_manual(
+      values = volc_cols,
+      breaks = c("Up", "Down", "NS"),
+      labels = c(
+        paste0("Up in cluster ", cluster_id),
+        paste0("Down in cluster ", cluster_id),
+        "Not significant"
+      ),
+      name = ""
+    ) +
+    geom_vline(xintercept = c(-logFC_cutoff, logFC_cutoff),
+               linetype = "dashed", linewidth = 0.3) +
+    geom_hline(yintercept = -log10(FDR_cutoff),
+               linetype = "dashed", linewidth = 0.3) +
+    labs(
+      x = paste0("log2 fold-change (cluster ", cluster_id, " vs rest)"),
+      y = "-log10 FDR",
+      title = paste0(title_prefix, " ", cluster_id, " vs rest (microglia; PC1–8, res 0.1)")
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      legend.position = "right",
+      axis.title = element_text(size = 14),
+      axis.text  = element_text(size = 12)
+    ) +
+    ggrepel::geom_text_repel(
+      data = label_genes,
+      aes(label = gene),
+      color = "black",
+      fontface = "bold",
+      size = 3.4,
+      max.overlaps = Inf,
+      box.padding = 0.4,
+      point.padding = 0.15,
+      segment.color = "grey40",
+      segment.size = 0.25,
+      show.legend = FALSE
+    )
+  
+  png_file <- file.path(out_dir, paste0("volcano_cluster", cluster_id, "_vs_rest_curatedMarkers.png"))
+  pdf_file <- file.path(out_dir, paste0("volcano_cluster", cluster_id, "_vs_rest_curatedMarkers.pdf"))
+  
+  ggsave(png_file, p, width = 7, height = 5, dpi = 600)
+  ggsave(pdf_file, p, width = 7, height = 5)
+  
+  invisible(list(plot = p, labels = label_genes))
+}
+
+# Example volcanoes for cluster 1 and 2 (customize cluster IDs as needed)
+plot_cluster_volcano("1", all_top_df, volcano_cluster_dir, microglia_all_markers)
+plot_cluster_volcano("2", all_top_df, volcano_cluster_dir, microglia_all_markers)
+
+# ------------------------------------------------------------------------------
+# 13. State-marker DEG heatmap (clusters vs rest, selected genes)
+# ------------------------------------------------------------------------------
+
+genes_homeostatic <- c("TMEM119", "SALL1", "OLFML3")
+genes_inflammatory <- c("IL1B", "TNF", "NLRP3")
+genes_lysosomal <- c("CD68", "CTSD", "CTSB")
+genes_DAM <- c("TREM2", "APOE", "SPP1")
+genes_proteostasis <- c("HMOX1", "HSPB1", "SQSTM1", "ATF6")
+
+genes_heatmap_16 <- c(
+  genes_homeostatic,
+  genes_inflammatory,
+  genes_lysosomal,
+  genes_DAM,
+  genes_proteostasis
+)
+
+clusters_of_interest <- 0:3  # example cluster set
+
+deg_sub <- all_top_df %>%
+  mutate(
+    cluster = as.numeric(as.character(cluster)),
+    gene    = as.character(gene),
+    logFC   = as.numeric(logFC),
+    FDR     = as.numeric(FDR)
+  ) %>%
+  filter(
+    cluster %in% clusters_of_interest,
+    gene %in% genes_heatmap_16
+  )
+
+deg_wide <- deg_sub %>%
+  mutate(
+    cluster = factor(cluster, levels = clusters_of_interest),
+    gene    = factor(gene, levels = genes_heatmap_16)
+  ) %>%
+  group_by(gene, cluster) %>%
+  summarise(
+    logFC = mean(logFC, na.rm = TRUE),
+    FDR   = min(FDR, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+FDR_cutoff <- 0.05
+
+heat_df <- deg_wide %>%
+  mutate(
+    logFC_plot = ifelse(FDR < FDR_cutoff, logFC, 0)
+  ) %>%
+  select(gene, cluster, logFC_plot) %>%
+  pivot_wider(names_from = cluster, values_from = logFC_plot) %>%
+  arrange(match(gene, genes_heatmap_16))
+
+heat_mat <- as.data.frame(heat_df)
+rownames(heat_mat) <- as.character(heat_mat$gene)
+heat_mat$gene <- NULL
+heat_mat <- as.matrix(heat_mat)
+heat_mat[is.na(heat_mat)] <- 0
+
+gene_category <- c(
+  setNames(rep("Homeostatic",      length(genes_homeostatic)),   genes_homeostatic),
+  setNames(rep("Inflammatory",     length(genes_inflammatory)),  genes_inflammatory),
+  setNames(rep("Lysosomal / Phag", length(genes_lysosomal)),     genes_lysosomal),
+  setNames(rep("DAM / Lipid",      length(genes_DAM)),           genes_DAM),
+  setNames(rep("Proteostasis / ER",length(genes_proteostasis)),  genes_proteostasis)
+)
+
+ann_row <- data.frame(
+  Category = gene_category[rownames(heat_mat)],
+  row.names = rownames(heat_mat),
+  check.names = FALSE
+)
+
+module_order2 <- c("Homeostatic", "Inflammatory", "Lysosomal / Phag",
+                   "DAM / Lipid", "Proteostasis / ER")
+
+mod_factor <- factor(ann_row$Category, levels = module_order2)
+row_order2  <- order(mod_factor)
+heat_mat_ord <- heat_mat[row_order2, , drop = FALSE]
+ann_row_ord  <- ann_row[row_order2, , drop = FALSE]
+gaps_row2 <- which(diff(as.integer(mod_factor[row_order2])) != 0)
+
+heat_cols <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(101)
+lim <- max(abs(heat_mat_ord), na.rm = TRUE)
+if (!is.finite(lim) || lim == 0) lim <- 1
+
+deg_heat_dir <- file.path(out_dir, "microglia_DEG_marker_heatmap_PC8_res0.1")
+dir.create(deg_heat_dir, recursive = TRUE, showWarnings = FALSE)
+
+png_file <- file.path(deg_heat_dir, "microglia_DEG_stateMarkers_logFC_clusters0to3.png")
+pdf_file <- file.path(deg_heat_dir, "microglia_DEG_stateMarkers_logFC_clusters0to3.pdf")
+
+pt_deg <- pheatmap(
+  heat_mat_ord,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  color        = heat_cols,
+  breaks       = seq(-lim, lim, length.out = length(heat_cols) + 1),
+  annotation_row = ann_row_ord,
+  gaps_row     = gaps_row2,
+  border_color = NA,
+  main         = "Microglia state markers (cluster vs rest logFC)",
+  fontsize     = 11,
+  fontsize_row = 10,
+  fontsize_col = 12
+)
+
+png(png_file, width = 7, height = 5, units = "in", res = 300, type = "cairo")
+grid.newpage(); grid.draw(pt_deg$gtable); dev.off()
+
+cairo_pdf(pdf_file, width = 7, height = 5)
+grid.newpage(); grid.draw(pt_deg$gtable); dev.off()
+
+# ------------------------------------------------------------------------------
+# 14. Module score dotplot: cluster x module & genotype x module
+# ------------------------------------------------------------------------------
+
+# This assumes you have already computed AddModuleScore() and stored
+# module scores as columns in microglia_subset@meta.data.
+# Example module columns (customize):
+module_cols <- c(
+  "P2RY12_PICALM",
+  "P2RY12_Sensome",
+  "P2RY12_FRMD4A",
+  "HSPB1_PD_DAM",
+  "SLC2A5_TMEM163",
+  "CD163_BAM",
+  "PCDH9_Pruning",
+  "SLC2A5_EIF2AK2"
+)
+
+missing_mod_cols <- setdiff(module_cols, colnames(microglia_subset@meta.data))
+if (length(missing_mod_cols) > 0) {
+  warning("Module score columns missing for dotplot: ",
+          paste(missing_mod_cols, collapse = ", "),
+          "\nSkipping module dotplots.")
+} else {
+  # cluster x module
+  cluster_df <- microglia_subset@meta.data %>%
+    select(all_of(cluster_col_final), all_of(module_cols)) %>%
+    group_by(cluster = .data[[cluster_col_final]]) %>%
+    summarise(across(all_of(module_cols), mean), .groups = "drop")
+  
+  dot_df <- cluster_df %>%
+    pivot_longer(
+      cols      = all_of(module_cols),
+      names_to  = "module",
+      values_to = "mean_score"
+    ) %>%
+    mutate(
+      cluster = factor(cluster, levels = sort(unique(cluster))),
+      module  = factor(module,  levels = module_cols),
+      prop    = abs(mean_score)
+    )
+  
+  dot_plot_dir <- file.path(out_dir, "microglia_module_plots")
+  dir.create(dot_plot_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  p_dot_cluster <- ggplot(dot_df, aes(x = module, y = cluster)) +
+    geom_point(
+      aes(fill = mean_score, size = prop),
+      shape = 21,
+      color = "black"
+    ) +
+    scale_fill_distiller(
+      palette   = "RdBu",
+      direction = -1,
+      name      = "Module score"
+    ) +
+    scale_size_continuous(
+      range  = c(3, 9),
+      name   = "Abs. score",
+      guide  = "legend"
+    ) +
+    labs(
+      x = "Module",
+      y = "Cluster"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      panel.grid      = element_blank(),
+      axis.text.x     = element_text(angle = 45, hjust = 1),
+      legend.position = "right",
+      legend.box      = "vertical",
+      plot.margin     = margin(10, 30, 10, 10)
+    ) +
+    coord_cartesian(clip = "off")
+  
+  ggsave(file.path(dot_plot_dir, "cluster_x_module_dotplot.png"),
+         p_dot_cluster, width = 8, height = 4, dpi = 300)
+  ggsave(file.path(dot_plot_dir, "cluster_x_module_dotplot.pdf"),
+         p_dot_cluster, width = 8, height = 4)
+  
+  # genotype x module
+  geno_df <- microglia_subset@meta.data %>%
+    select(genotype, all_of(module_cols)) %>%
+    drop_na(genotype) %>%
+    pivot_longer(
+      cols      = all_of(module_cols),
+      names_to  = "module",
+      values_to = "score"
+    ) %>%
+    group_by(genotype, module) %>%
+    summarise(
+      mean_score = mean(score, na.rm = TRUE),
+      prop       = mean(score > 0, na.rm = TRUE),
+      .groups    = "drop"
+    ) %>%
+    mutate(
+      genotype = factor(genotype, levels = genotype_levels),
+      module   = factor(module, levels = module_cols)
+    ) %>%
+    filter(!is.na(genotype))
+  
+  max_abs <- stats::quantile(abs(geno_df$mean_score), probs = 0.95, na.rm = TRUE)
+  if (!is.finite(max_abs) || max_abs == 0) max_abs <- 1
+  
+  p_dot_geno <- ggplot(geno_df, aes(x = module, y = genotype)) +
+    geom_point(
+      aes(size = prop, fill = mean_score),
+      shape = 21,
+      color = "black"
+    ) +
+    scale_fill_distiller(
+      palette   = "RdBu",
+      direction = -1,
+      limits    = c(-max_abs, max_abs),
+      name      = "Module score"
+    ) +
+    scale_size_continuous(
+      name   = "Proportion",
+      range  = c(3, 10),
+      limits = c(0, 1),
+      breaks = c(0.2, 0.4, 0.6),
+      labels = percent_format(accuracy = 1)
+    ) +
+    labs(
+      x = "Module",
+      y = "Genotype"
+    ) +
+    coord_cartesian(clip = "off") +
+    theme_classic(base_size = 14) +
+    theme(
+      panel.grid      = element_blank(),
+      axis.text.x     = element_text(angle = 45, hjust = 1, vjust = 1),
+      legend.position = "bottom",
+      legend.box      = "horizontal",
+      plot.margin     = margin(10, 10, 40, 10)
+    )
+  
+  ggsave(file.path(dot_plot_dir, "genotype_x_module_dotplot.png"),
+         p_dot_geno, width = 11, height = 4, dpi = 300)
+  ggsave(file.path(dot_plot_dir, "genotype_x_module_dotplot.pdf"),
+         p_dot_geno, width = 11, height = 4)
+}
+
+# ------------------------------------------------------------------------------
+# 15. Pseudobulk expression for genes of interest (Raphael genes) + per-cell violins
+# ------------------------------------------------------------------------------
+
+goi <- c(
+  "P2RY12",
+  "PICALM",
+  "FRMD4A",
+  "HSPB1",
+  "SLC2A5",
+  "TMEM163",
+  "CD163",
+  "PCDH9",
+  "EIF2AK2"
+)
+
+# Map genes to pseudobulk_counts
+goi_present <- unique(na.omit(map_genes_ci(goi, rownames(pseudobulk_counts))))
+if (length(goi_present) > 0) {
+  pb_logcpm <- edgeR::cpm(
+    pseudobulk_counts[goi_present, , drop = FALSE],
+    log = TRUE,
+    prior.count = 1
+  )
+  
+  pb_df <- as.data.frame(t(pb_logcpm)) %>%
+    mutate(sample = rownames(.)) %>%
+    pivot_longer(
+      cols      = all_of(goi_present),
+      names_to  = "gene",
+      values_to = "logCPM"
+    ) %>%
+    left_join(sample_meta_ordered, by = c("sample" = "sample")) %>%
+    mutate(
+      genotype = case_when(
+        genotype %in% c("GG", "G/G", "G_G", "G") ~ "GG",
+        genotype %in% c("AA", "A/A", "A_A", "A") ~ "AA",
+        TRUE ~ genotype
+      ),
+      genotype = factor(genotype, levels = c("GG", "AA"))
+    ) %>%
+    filter(genotype %in% c("GG", "AA"))
+  
+  gen_colors2 <- c("GG" = "#1f78b4", "AA" = "#d95f02")
+  
+  p_pb <- ggplot(pb_df, aes(x = genotype, y = logCPM, color = genotype)) +
+    geom_boxplot(
+      width = 0.5,
+      outlier.shape = NA,
+      alpha = 0.2,
+      linewidth = 0.8
+    ) +
+    geom_jitter(width = 0.08, size = 2.5, alpha = 0.9) +
+    facet_wrap(~ gene, scales = "free_y", nrow = 2) +
+    scale_color_manual(values = gen_colors2) +
+    labs(
+      x = "",
+      y = "log2 CPM",
+      title = "Per-sample pseudobulk expression (GG vs AA microglia)"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      legend.position = "none",
+      strip.text      = element_text(size = 12, face = "bold"),
+      axis.text.x     = element_text(size = 12),
+      axis.text.y     = element_text(size = 11)
+    )
+  
+  ggsave(file.path(out_dir, "pseudobulk_Raphael_genes_logCPM_GG_vs_AA.png"),
+         p_pb, width = 8, height = 4, dpi = 300)
+  ggsave(file.path(out_dir, "pseudobulk_Raphael_genes_logCPM_GG_vs_AA.pdf"),
+         p_pb, width = 8, height = 4)
+  
+  # Per-cell violins by cluster (using normalized data)
+  assay_choice <- if ("SCT" %in% Assays(microglia_subset)) "SCT" else "RNA"
+  DefaultAssay(microglia_subset) <- assay_choice
+  
+  all_genes_obj <- rownames(microglia_subset)
+  genes_mapped_obj <- unique(na.omit(map_genes_ci(goi, all_genes_obj)))
+  
+  if (length(genes_mapped_obj) > 0) {
+    vln_plot <- VlnPlot(
+      microglia_subset,
+      features = genes_mapped_obj,
+      group.by = cluster_col_final,
+      assay    = assay_choice,
+      slot     = "data",
+      pt.size  = 0.1,
+      ncol     = 3
+    ) +
+      theme_classic(base_size = 14) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text  = element_text(size = 12, face = "bold")
+      )
+    
+    ggsave(file.path(out_dir, "percell_Raphael_genes_violin_by_cluster.png"),
+           vln_plot, width = 10, height = 7, dpi = 300)
+    ggsave(file.path(out_dir, "percell_Raphael_genes_violin_by_cluster.pdf"),
+           vln_plot, width = 10, height = 7)
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 16. Global AA vs GG summary & microglia markers with nominal p < 0.05
+# ------------------------------------------------------------------------------
+
+top_global <- top_global %>%
+  mutate(
+    logFC   = as.numeric(logFC),
+    logCPM  = as.numeric(logCPM),
+    PValue  = as.numeric(PValue),
+    FDR     = as.numeric(FDR)
+  )
+
+sig_FDR05 <- top_global %>% filter(FDR < 0.05)
+sig_FDR10 <- top_global %>% filter(FDR < 0.10)
+sig_p05   <- top_global %>% filter(PValue < 0.05)
+
+cat("==== GLOBAL AA vs GG (all microglia) ====\n")
+cat("Total genes tested: ", nrow(top_global), "\n")
+cat("FDR < 0.05:        ", nrow(sig_FDR05), "\n")
+cat("FDR < 0.10:        ", nrow(sig_FDR10), "\n")
+cat("Nominal p < 0.05:  ", nrow(sig_p05), "\n\n")
+
+sig_p05_all <- top_global %>%
+  filter(PValue < 0.05) %>%
+  arrange(desc(logFC))
+
+markers_nominal <- sig_p05_all %>%
+  mutate(gene_upper = toupper(gene)) %>%
+  filter(gene_upper %in% marker_set_upper) %>%
+  select(-gene_upper) %>%
+  arrange(desc(logFC))
+
+out_all295 <- file.path(
+  deg_dir,
+  "global_microglia_nominalP_lt0.05_ALLgenes_by_logFC.csv"
+)
+out_markers <- file.path(
+  deg_dir,
+  "global_microglia_nominalP_lt0.05_MICROGLIAmarkers_by_logFC.csv"
+)
+
+write.csv(sig_p05_all %>% select(gene, logFC, logCPM, PValue, FDR),
+          out_all295, row.names = FALSE)
+write.csv(markers_nominal %>% select(gene, logFC, logCPM, PValue, FDR),
+          out_markers, row.names = FALSE)
+
+cat("✔ Wrote all nominal hits to:\n  ", normalizePath(out_all295), "\n")
+cat("✔ Wrote microglia-marker subset to:\n  ", normalizePath(out_markers), "\n")
+
+# ------------------------------------------------------------------------------
+# 17. Global AA vs GG volcano plot with selected labeled genes (example)
+# ------------------------------------------------------------------------------
+
+pval_cutoff  <- 0.05
+logfc_cutoff <- 0.25
+
+volc_df <- top_global %>%
+  mutate(
+    gene = as.character(gene),
+    negLog10P = -log10(PValue)
+  ) %>%
+  mutate(
+    negLog10P = ifelse(is.infinite(negLog10P) | is.na(negLog10P), NA_real_, negLog10P)
+  )
+
+# Example list of genes to label (customize)
+label_genes_input <- c(
+  "IL1RN","IL32","BST1",      # buffered inflammation / immune regulation
+  "TNFSF13","NGF","PRLR","PLXNA4",
+  "ATP6V1C2","AP1S3",
+  "DEGS2","DEGS1",
+  "PTX3","CXCL1","CXCL13","TLR3",
+  "MAOB","NOX4","STEAP3",
+  "CD300LB","SLAMF7","TNFRSF25",
+  "CYTL1","GBP3","ENPP6","FST"
+)
+
+label_genes_mapped <- unique(na.omit(map_genes_ci(label_genes_input, volc_df$gene)))
+
+volc_df <- volc_df %>%
+  mutate(
+    sig = ifelse(!is.na(PValue) & PValue < pval_cutoff &
+                   !is.na(logFC) & abs(logFC) >= logfc_cutoff, TRUE, FALSE),
+    direction = case_when(
+      sig & logFC >  0            ~ "Up",
+      sig & logFC <  0            ~ "Down",
+      TRUE                        ~ "NS"
+    ),
+    direction = factor(direction, levels = c("Up", "Down", "NS"))
+  )
+
+label_df <- volc_df %>%
+  filter(gene %in% label_genes_mapped)
+
+volc_cols2 <- c(
+  "NS"   = "grey80",
+  "Down" = "#1f78b4",
+  "Up"   = "#e31a1c"
+)
+
+p_volc_global <- ggplot(volc_df, aes(x = logFC, y = negLog10P, color = direction)) +
+  geom_point(alpha = 0.7, size = 1.4, na.rm = TRUE) +
+  scale_color_manual(
+    values = volc_cols2,
+    breaks = c("Up", "Down", "NS"),
+    labels = c("Up in AA", "Down in AA", "Not significant"),
+    name = ""
+  ) +
+  geom_vline(xintercept = c(-logfc_cutoff, logfc_cutoff),
+             linetype = "dashed", linewidth = 0.3) +
+  geom_hline(yintercept = -log10(pval_cutoff),
+             linetype = "dashed", linewidth = 0.3) +
+  labs(
+    x = "log2 fold-change (AA vs GG)",
+    y = "-log10 p-value",
+    title = "Global AA vs GG (microglia pseudobulk)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    axis.title = element_text(size = 14),
+    axis.text  = element_text(size = 12)
+  ) +
+  ggrepel::geom_text_repel(
+    data = label_df,
+    aes(label = gene),
+    color = "black",
+    fontface = "bold",
+    size = 3.0,
+    max.overlaps = Inf,
+    box.padding = 0.6,
+    point.padding = 0.25,
+    force = 2,
+    max.time = 2,
+    segment.color = "grey50",
+    segment.size = 0.25,
+    show.legend = FALSE
+  )
+
+out_prefix <- file.path(out_dir, "volcano_global_AA_vs_GG_nominal")
+ggsave(paste0(out_prefix, "_labeled.png"), p_volc_global, width = 7.5, height = 5, dpi = 600)
+ggsave(paste0(out_prefix, "_labeled.pdf"), p_volc_global, width = 7.5, height = 5)
+
+# ------------------------------------------------------------------------------
