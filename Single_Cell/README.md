@@ -16,20 +16,21 @@ The pipeline follows a strict, staged order from raw FASTQs to integrated object
 
 ---
 
-## Folder structure
-
-    Single_Cell/
-    ├── scripts/
-    │   ├── run_cellranger_all.sh
-    │   ├── run_cellbender_all.sh
-    │   ├── miBrain_QC_filtering.R
-    │   ├── Seurat_integration_harmony.R
-    │   └── microglia_subset_signatures.R
-    └── docs/
-        └── (analysis notes, troubleshooting, version info)
+Single_Cell/
+├── scripts/
+│   ├── run_cellranger_all.sh
+│   ├── run_cellbender_all.sh
+│   ├── miBrain_QC_filtering.R
+│   ├── QC_filtering_integration_clustering.R
+│   ├── Seurat_integration_harmony.R
+│   ├── microglia_subset_signatures.R
+│   ├── Pseudobulk_Dream_Pathway_analysis.R
+│   ├── Pseudobulk_edgeR.R
+│   └── Propeller_Camera.R
+└── docs/
+    └── (analysis notes, troubleshooting, version info)
 
 ---
-
 ## 1. Cell Ranger
 
 **Script:**  
@@ -122,6 +123,64 @@ This script is run **after integration** and operates on an integrated Seurat ob
 - Saving of a microglia-specific Seurat object
 
 ---
+
+## 6. Microglia pseudobulk analyses
+
+All scripts in this section operate on **pseudobulk microglia data** derived from the integrated Seurat object. These analyses are performed after microglia identification, subsetting, and reclustering.
+
+---
+
+## 6.1 Pseudobulk differential expression and pathway analysis (DREAM)
+
+**Script:**  
+Single_Cell/scripts/Pseudobulk_Dream_Pathway_analysis.R
+
+This script performs microglia pseudobulk differential expression using **DREAM**, accounting for sample-level random effects.
+
+Downstream pathway and gene-set enrichment analyses are performed on DREAM results.
+
+---
+
+## 7 Pseudobulk differential expression (edgeR)
+
+**Script:**  
+Single_Cell/scripts/Pseudobulk_edgeR.R
+
+This script constructs microglia pseudobulk expression profiles per sample and performs differential expression using **edgeR**.
+
+It serves as an alternative DEG framework to DREAM and is useful for method comparison and robustness checks.
+
+---
+
+## 8 Abundance testing and gene-set analysis (Propeller + CAMERA)
+
+**Script:**  
+Single_Cell/scripts/Propeller_Camera.R
+
+This script performs complementary pseudobulk-based statistical analyses on microglia:
+
+**Abundance testing (Propeller-style limma):**
+- Tests cluster-level abundance differences between genotypes
+- Tests state-level abundance differences (e.g., Homeostatic vs DAM)
+- Uses asin(sqrt(proportion)) transformation
+- Applies cell-count–based precision weights
+
+**Gene-set testing (CAMERA):**
+- Tests curated microglial gene modules
+- Accounts for inter-gene correlation
+- Operates on voom-transformed pseudobulk expression data
+- Reports directionality and FDR-adjusted significance
+
+All analyses in this script are restricted to microglia and assume pseudobulk inputs.
+
+---
+
+
+
+
+
+
+
 
 ## Docs and notes
 
