@@ -1,91 +1,95 @@
+
 # RNA-seq Pipelines (MiBrain / Minerva)
 
-This repository contains pipelines and documentation for running **bulk** and **single-cell RNA-seq** analyses for MiBrain projects on the Minerva HPC cluster.
+This repository contains reproducible RNA-seq analysis pipelines developed for the **MiBrain iPSC-derived model system**, designed for execution on the **Minerva HPC cluster**.
 
 The repository is organized into two primary workflows aligned with project aims:
 
-- **Aim 1 — Bulk RNA-seq**: alignment, quantification, differential expression, and pathway analysis  
-- **Aim 2 — Single-cell RNA-seq**: preprocessing, QC, integration, and downstream cell-type–specific analyses  
+1. **Bulk RNA-seq analysis**
+2. **Single-cell RNA-seq analysis**, including cell-type–specific and pseudobulk downstream analyses
 
 ---
 
 # 1. Bulk RNA-seq Pipeline (MiBrain / Minerva)
 
-The bulk RNA-seq pipeline supports alignment, quantification, differential expression, and pathway analysis for bulk RNA-seq datasets.
+The bulk RNA-seq pipeline supports preprocessing, alignment, quantification, differential expression, and pathway analysis for bulk RNA-seq datasets.
 
 ---
 
 ## 1.1 Pipeline overview
 
 1. **RAPiD** — preprocessing, QC, alignment, and quantification  
-2. **Collate samples** (planned) — combine count matrices  
-3. **Differential expression analysis** — DESeq2  
-4. **Pathway analysis** — GSEA and ORA  
+2. **Sample collation** — combine gene-level count matrices  
+3. **Differential expression analysis**  
+4. **Pathway and gene-set enrichment analysis**
 
 ---
 
 ## 1.2 Folder structure (Bulk)
 
-    Bulk/
-    ├── scripts/
-    │   ├── 00_run_RAPiD.sh
-    │   ├── 01_collate_samples.R
-    │   ├── BULK_rnaseq_DEG.R
-    │   └── BULK_rnaseq_pathway_1.R
-    └── docs/
-        ├── RAPiD_details.md
-        ├── RAPiD_tips_jen.md
-        └── DEG_pathway_details.md
+```text
+Bulk/
+├── scripts/
+│   ├── 00_run_RAPiD.sh
+│   ├── 01_collate_samples.R
+│   ├── BULK_rnaseq_DEG.R
+│   └── BULK_rnaseq_pathway_1.R
+└── docs/
+    ├── RAPiD_details.md
+    ├── RAPiD_tips_jen.md
+    └── DEG_pathway_details.md
+```
 
 ---
 
 ## 1.3 RAPiD — preprocessing / alignment / QC
 
 RAPiD performs:
+
 - Adapter trimming (Trimmomatic)
 - QC (FastQC, Picard)
 - Alignment (STAR)
 - Gene quantification (featureCounts, Salmon, Kallisto, RSEM)
 - Splicing analysis (LeafCutter)
-- Aggregated QC reports (MultiQC)
+- Aggregated QC reporting (MultiQC)
 
-Documentation:
-- Bulk/docs/RAPiD_details.md  
-- Bulk/docs/RAPiD_tips_jen.md  
+**Documentation:**
+- `Bulk/docs/RAPiD_details.md`
+- `Bulk/docs/RAPiD_tips_jen.md`
 
 ---
 
 ## 1.4 Differential expression analysis (DESeq2)
 
 **Script:**  
-Bulk/scripts/BULK_rnaseq_DEG.R
+`Bulk/scripts/BULK_rnaseq_DEG.R`
 
-Inputs:
+**Inputs:**
 - featureCounts matrix  
 - Sample metadata  
 
-Outputs:
+**Outputs:**
 - Raw DEG results  
 - Shrunk logFC results  
-- QC plots and result tables  
+- QC plots and summary tables  
 
 ---
 
 ## 1.5 Pathway analysis (GSEA + ORA)
 
 **Script:**  
-Bulk/scripts/BULK_rnaseq_pathway_1.R
+`Bulk/scripts/BULK_rnaseq_pathway_1.R`
 
 Performs:
 - GSEA (fgseaMultilevel)
 - Over-representation analysis (KEGG, GO, Hallmark)
-- Standard enrichment plots
+- Standard enrichment visualizations
 
 ---
 
 # 2. Single-cell RNA-seq Pipeline (MiBrain / Minerva)
 
-**Preprocessing, QC, integration, clustering, annotation, and downstream analyses for MiBrain scRNA-seq data**
+Preprocessing, QC, integration, clustering, annotation, and downstream cell-type–specific analyses for MiBrain scRNA-seq data.
 
 ---
 
@@ -99,93 +103,63 @@ Performs:
 
 ---
 
-## 2.2 Folder structure (Single-cell)
+## 2.2 Single-cell RNA-seq workflow overview
 
-    Single_Cell/
-    ├── scripts/
-    │   ├── run_cellranger_all.sh
-    │   ├── run_cellbender_all.sh
-    │   ├── miBrain_QC_filtering.R
-    │   ├── Seurat_integration_harmony.R
-    │   └── microglia_subset_signatures.R
-    └── docs/
-        └── (analysis notes, troubleshooting, version info)
+The single-cell workflow supports end-to-end analysis of MiBrain scRNA-seq data on Minerva, from raw FASTQs to integrated objects and cell-type–specific statistical analyses.
 
----
+Core stages include:
 
-## 2.3 Key scripts (Single-cell)
+- Cell Ranger preprocessing
+- CellBender background RNA correction
+- Per-sample QC and filtering
+- Seurat + Harmony integration and annotation
+- Cell-type–specific downstream analyses (currently focused on microglia)
 
-### Cell Ranger
+Downstream microglia analyses include:
 
-**Script:**  
-Single_Cell/scripts/run_cellranger_all.sh
+- Subsetting and reclustering
+- Pseudobulk differential expression (DREAM and edgeR)
+- Abundance testing (Propeller)
+- Gene-set testing accounting for inter-gene correlation (CAMERA)
 
-- Alignment  
-- Basic QC  
-- Gene-level count matrices (per sample)
+Detailed documentation, script descriptions, and execution order are provided in:
+
+`Single_Cell/README.md`
 
 ---
 
-### CellBender
+## 2.3 Folder structure (Single-cell)
 
-**Script:**  
-Single_Cell/scripts/run_cellbender_all.sh
-
-Removes ambient/background RNA from Cell Ranger outputs.
-
----
-
-### QC and filtering (per-sample)
-
-**Script:**  
-Single_Cell/scripts/miBrain_QC_filtering.R
-
-- Cell-level QC filtering (features, counts, mitochondrial content)  
-- Removal of low-quality cells  
-- Outputs QC’d per-sample Seurat objects  
-- **No cell-type annotation performed at this stage**
-
----
-
-### Seurat + Harmony integration and annotation
-
-**Script:**  
-Single_Cell/scripts/Seurat_integration_harmony.R
-
-- SCTransform normalization  
-- Sample integration  
-- Harmony batch correction  
-- Clustering and UMAP  
-- Marker detection  
-- Cell-type annotation  
-
----
-
-### Microglia subset and gene signature analysis
-
-**Script:**  
-Single_Cell/scripts/microglia_subset_signatures.R
-
-Downstream analysis performed **after integration**, including:
-- Identification and subsetting of microglia  
-- Microglial reprocessing and subclustering  
-- Module scoring and cluster-level summaries  
-- Genotype enrichment analyses  
-- Publication-ready plots and heatmaps  
-- Saving of a microglia-specific Seurat object  
+```text
+Single_Cell/
+├── scripts/
+│   ├── run_cellranger_all.sh
+│   ├── run_cellbender_all.sh
+│   ├── miBrain_QC_filtering.R
+│   ├── QC_filtering_integration_clustering.R
+│   ├── Seurat_integration_harmony.R
+│   ├── microglia_subset_signatures.R
+│   ├── Pseudobulk_Dream_Pathway_analysis.R
+│   ├── Pseudobulk_edgeR.R
+│   └── Propeller_Camera.R
+└── docs/
+    └── (analysis notes, troubleshooting, version info)
+```
 
 ---
 
 ## 2.4 Example MiBrain single-cell project layout (Minerva)
 
-    /sc/arion/projects/ad-omics/Jennifer/scRNA_mibrain_P2RY12
-    ├── 00_fastq/
-    ├── 01_pilot_fastq/
-    ├── 02_cellranger/
-    ├── 03_cellbender/
-    ├── 04_seurat_objects/
-    ├── logs/
-    └── metadata/
+```text
+/sc/arion/projects/ad-omics/Jennifer/scRNA_mibrain_P2RY12
+├── 00_fastq/
+├── 01_pilot_fastq/
+├── 02_cellranger/
+├── 03_cellbender/
+├── 04_seurat_objects/
+├── logs/
+└── metadata/
+```
 
 ---
 
@@ -193,4 +167,4 @@ Downstream analysis performed **after integration**, including:
 
 - This repository is designed for use on the **Minerva HPC cluster**
 - Script headers contain required input paths and configuration details
-- Documentation is intentionally modular so pipelines can be adapted to new projects
+- Documentation is intentionally modular to support reuse and adaptation across projects
