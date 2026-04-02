@@ -1,5 +1,5 @@
 ###############################################################################
-# microglia_pipeline_cleaned.R
+# microglia_subset_signatures.R
 #
 # Clean, modular, and generic pipeline to:
 #  - identify microglia from score/module columns
@@ -671,8 +671,689 @@ str(mg@misc$gene_signatures, max.level = 1)
 
 out_rds <- file.path(outdir, microglia_rds_name)
 saveRDS(mg, file = out_rds, compress = save_rds_compress)
-log_msg("Saved final microglia object to: ", out_rds)
+log_msg("Saved microglia object to: ", out_rds)
 
+
+########################
+#added on to prepare for psuedobulking
+########################
+
+                      
+#!/usr/bin/env Rscript
+# microglia_assign_MG_STATE.R
+# Generic script to assign cluster -> MG_STATE (Homeostatic / Activated / DAM)
+# using per-gene z (cluster-level) and output canonical CSVs + RDS.
+#
+# Usage: source() or run in an active R session after setting params at top.
+
+# --------- PARAMETERS (edit) -----------
+input_rds <- "Microglia_gene_signatures.rds"   # input Seurat RDS (generic path)
+outdir <- "outputs_microglia_MG_state"         # output folder (created if missing)
+seurat_obj_varname <- "obj"                    # variable name to assign the Seurat object to
+output_rds <- file.path(outdir, "Microglia_MG_state.rds")
+# ----------------------------------------
+
+# --------- Libraries ----------
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(tibble)
+})
+
+# --------- small logger ----------
+log_msg <- function(...) message(paste0(...))
+
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# --------- 0. Load object (generic) ----------
+stopifnot(file.exists(input_rds))
+log_msg("Loading input RDS: ", input_rds)
+tmp_obj <- readRDS(input_rds)
+assign(seurat_obj_varname, tmp_obj)
+rm(tmp_obj)
+obj <- get(seurat_obj_varname)
+stopifnot(inherits(obj, "Seurat"))
+log_msg("Object loaded. DefaultAssay: ", DefaultAssay(obj))
+
+# ensure basic metadata fields exist
+required_meta <- c("mg_cluster", "sample_id", "genotype", "batch")
+missing_meta <- setdiff(required_meta, colnames(obj@meta.data))
+if (length(missing_meta) > 0) {
+  stop("Missing required metadata columns: ", paste(missing_meta, collapse = ", "))
+}
+
+# --------- 1. Marker sets (edit if you want different panels) ----------
+MG_HOMEOSTATIC <- c("P2RY12","TMEM119","SALL1","CX3CR1","CSF1R","FCRLS","GPR34","P2RX7")
+MG_ACTIVATED   <- c("HLA-DRA","CD68","CD74","ITGAM","ITGB2","CD40","CD86","CD14")
+MG_DAM         <- c("TREM2","APOE","SPP1","GPNMB","TYROBP","LPL","CD9","CST7")
+
+state_marker_list <- list(
+  Homeostatic = MG_HOMEOSTATIC,
+  Activated   = MG_ACTIVATED,
+  DAM         = MG_DAM
+)
+
+# Check presence of marker genes in RNA assay
+DefaultAssay(obj) <- "RNA"
+present_genes <- intersect(unique(unlist(state_marker_list)), rownames(obj))
+missing_genes <- setdiff(unique(unlist(state_marker_list)), present_genes)
+if (length(missing_genes) > 0) {
+  log_msg("Warning - missing genes (will be skipped): ", paste(missing_genes, collapse = ", "))
+} else {
+  log_msg("All marker genes present.")
+}
+
+# --------- 2. Compute cluster-level mean expression and per-gene z across clusters ----------
+# Use layer = "data" for Seurat v5 compatibility (log-normalized values in RNA@data)
+expr_layer <- "data"
+log_msg("Reading expression data (layer = '", expr_layer, "') and computing AverageExpression by mg_cluster.")
+avg_list <- AverageExpression(obj, assays = "RNA", slot = expr_layer, group.by = "mg_cluster", verbose = FALSE)
+avg_mat <- avg_list$RNA   # genes x clusters
+
+cluster_names <- colnames(avg_mat)
+log_msg("Clusters found in average expression matrix: ", paste(cluster_names, collapse = ", "))
+
+marker_genes <- intersect(unique(unlist(state_marker_list)), rownames(avg_mat))
+if (length(marker_genes) == 0) stop("None of the marker genes are present in avg_mat. Aborting.")
+
+avg_markers_mat <- avg_mat[marker_genes, , drop = FALSE]
+
+per_gene_z <- function(mat) {
+  # per-gene z-score across clusters (rows = genes)
+  z <- t(scale(t(as.matrix(mat)), center = TRUE, scale = TRUE))
+  z[is.na(z)] <- 0
+  return(z)
+}
+mat_z <- per_gene_z(avg_markers_mat)
+
+# Write cluster gene mean expression and z
+cluster_gene_mean_expr <- as.data.frame(avg_markers_mat) %>% rownames_to_column("gene")
+fn_meanexpr <- file.path(outdir, "cluster_gene_mean_expr_genes_x_clusters.csv")
+write_csv(cluster_gene_mean_expr, fn_meanexpr)
+
+cluster_gene_z <- as.data.frame(mat_z) %>% rownames_to_column("gene")
+fn_genez <- file.path(outdir, "cluster_gene_z_genes_x_clusters.csv")
+write_csv(cluster_gene_z, fn_genez)
+
+log_msg("Wrote: ", fn_meanexpr)
+log_msg("Wrote: ", fn_genez)
+
+# --------- 3. Compute cluster × state scores (mean z across marker genes for each state) ----------
+clusters <- colnames(mat_z)
+cluster_state_scores <- matrix(NA_real_, nrow = length(clusters), ncol = length(state_marker_list),
+                               dimnames = list(clusters, names(state_marker_list)))
+
+for (st in names(state_marker_list)) {
+  genes_st <- intersect(state_marker_list[[st]], rownames(mat_z))
+  if (length(genes_st) == 0) {
+    cluster_state_scores[, st] <- 0
+  } else {
+    cluster_state_scores[, st] <- colMeans(mat_z[genes_st, , drop = FALSE], na.rm = TRUE)
+  }
+}
+cluster_state_scores_df <- as.data.frame(cluster_state_scores) %>% rownames_to_column("cluster")
+fn_cluster_state_scores <- file.path(outdir, "cluster_state_scores_meanZ.csv")
+write_csv(cluster_state_scores_df, fn_cluster_state_scores)
+log_msg("Wrote: ", fn_cluster_state_scores)
+
+# --------- 4. Assign cluster -> MG_STATE by top mean z; compute delta and confidence ----------
+# ensure cluster column present
+cluster_state_scores_df <- cluster_state_scores_df %>% mutate(cluster = as.character(cluster))
+
+# identify numeric state columns
+state_score_cols <- cluster_state_scores_df %>% select(-cluster) %>% select(where(is.numeric)) %>% colnames()
+if (length(state_score_cols) < 1) stop("No numeric state-score columns found in cluster_state_scores_df.")
+
+# compute assigned state, deltas, cluster sizes
+cluster_to_state_df <- cluster_state_scores_df %>%
+  rowwise() %>%
+  mutate(
+    .vals = list(c_across(all_of(state_score_cols))),
+    best_i = which.max(.vals),
+    ord = list(order(.vals, decreasing = TRUE)),
+    second_i = ifelse(length(.vals) >= 2, ord[[1]][2], NA_integer_),
+    assigned_state = state_score_cols[best_i],
+    top_mean_z = as.numeric(.vals[best_i]),
+    second_mean_z = ifelse(!is.na(second_i), as.numeric(.vals[second_i]), NA_real_),
+    delta_z = top_mean_z - second_mean_z,
+    n_cells_in_cluster = as.integer(ifelse(as.character(cluster) %in% names(table(obj$mg_cluster)),
+                                           table(obj$mg_cluster)[as.character(cluster)],
+                                           ifelse(sub("^(?:g|G|MG|mg)?", "", cluster) %in% names(table(sub("^(?:g|G|MG|mg)?", "", obj$mg_cluster))),
+                                                  table(sub("^(?:g|G|MG|mg)?", "", obj$mg_cluster))[sub("^(?:g|G|MG|mg)?", "", cluster)],
+                                                  0))),
+    note_flag = NA_character_
+  ) %>%
+  ungroup() %>%
+  select(-.vals, -best_i, -ord, -second_i)
+
+# set confidence levels (relaxed thresholds — adjust if you want stricter)
+cluster_to_state_df <- cluster_to_state_df %>%
+  mutate(
+    conf_level = case_when(
+      is.na(delta_z) ~ "low",
+      delta_z >= 0.30 ~ "high",
+      delta_z >= 0.10 ~ "moderate",
+      TRUE ~ "low"
+    ),
+    note_flag = ifelse(n_cells_in_cluster < 20, paste0("small_n=", n_cells_in_cluster), note_flag)
+  )
+
+# Write cluster->state mapping
+fn_cluster_to_state <- file.path(outdir, "cluster_to_state.csv")
+write_csv(cluster_to_state_df, fn_cluster_to_state)
+log_msg("Wrote: ", fn_cluster_to_state)
+
+# --------- 5. Robust mapping keys and per-cell assignment ----------
+cts <- cluster_to_state_df %>%
+  mutate(mg_cluster_key = as.character(cluster),
+         mg_cluster_key_num = sub("^(?:g|G|MG|mg)?", "", mg_cluster_key))
+
+map_conf_primary <- setNames(cts$conf_level, cts$mg_cluster_key)
+map_delta_primary <- setNames(cts$delta_z, cts$mg_cluster_key)
+map_state_primary <- setNames(cts$assigned_state, cts$mg_cluster_key)
+
+map_conf_num <- setNames(cts$conf_level, cts$mg_cluster_key_num)
+map_delta_num <- setNames(cts$delta_z, cts$mg_cluster_key_num)
+map_state_num <- setNames(cts$assigned_state, cts$mg_cluster_key_num)
+
+cell_clusters <- as.character(obj$mg_cluster)
+cell_clusters_num <- sub("^(?:g|G|MG|mg)?", "", cell_clusters)
+
+conf_vec <- map_conf_primary[cell_clusters]
+delta_vec <- map_delta_primary[cell_clusters]
+state_vec <- map_state_primary[cell_clusters]
+
+missing_idx <- which(is.na(conf_vec) | is.na(delta_vec) | is.na(state_vec))
+if (length(missing_idx) > 0) {
+  conf_vec[missing_idx] <- map_conf_num[cell_clusters_num[missing_idx]]
+  delta_vec[missing_idx] <- map_delta_num[cell_clusters_num[missing_idx]]
+  state_vec[missing_idx] <- map_state_num[cell_clusters_num[missing_idx]]
+}
+
+conf_vec[is.na(conf_vec)] <- NA_character_
+delta_vec[is.na(delta_vec)] <- NA_real_
+state_vec[is.na(state_vec)] <- NA_character_
+
+stopifnot(length(conf_vec) == nrow(obj@meta.data))
+stopifnot(length(delta_vec) == nrow(obj@meta.data))
+stopifnot(length(state_vec) == nrow(obj@meta.data))
+
+# assign into metadata (use @meta.data directly to avoid Seurat $ assignment edge cases)
+obj@meta.data$MG_STATE_assigned   <- as.character(state_vec)
+obj@meta.data$MG_STATE_confidence <- as.character(conf_vec)
+obj@meta.data$MG_STATE_delta_z    <- as.numeric(delta_vec)
+obj@meta.data$MG_STATE_note       <- ifelse(is.na(obj@meta.data$MG_STATE_assigned), "unassigned", NA_character_)
+
+# sync $ accessor
+obj$MG_STATE_assigned <- obj@meta.data$MG_STATE_assigned
+obj$MG_STATE_confidence <- obj@meta.data$MG_STATE_confidence
+obj$MG_STATE_delta_z <- obj@meta.data$MG_STATE_delta_z
+obj$MG_STATE_note <- obj@meta.data$MG_STATE_note
+
+log_msg("Per-cell MG_STATE fields added to object metadata.")
+
+# --------- 6. Build sample-level manifest & sample x cluster/state matrices ----------
+meta_df <- obj@meta.data %>% as.data.frame() %>% tibble::rownames_to_column("cell_barcode")
+
+sample_summary <- meta_df %>%
+  group_by(sample_id) %>%
+  summarise(
+    n_microglia_total = n(),
+    pct_AA_in_sample = 100 * mean(genotype == "AA"),
+    pct_GG_in_sample = 100 * mean(genotype == "GG"),
+    .groups = "drop"
+  )
+
+sample_x_cluster_counts <- meta_df %>%
+  count(sample_id, mg_cluster) %>%
+  pivot_wider(names_from = mg_cluster, values_from = n, values_fill = 0) %>%
+  arrange(sample_id)
+
+sample_x_state_counts <- meta_df %>%
+  mutate(MG_STATE_assigned = ifelse(is.na(MG_STATE_assigned), "Unassigned", MG_STATE_assigned)) %>%
+  count(sample_id, MG_STATE_assigned) %>%
+  pivot_wider(names_from = MG_STATE_assigned, values_from = n, values_fill = 0) %>%
+  arrange(sample_id)
+
+sample_meta_one <- meta_df %>%
+  group_by(sample_id) %>%
+  summarise(
+    batch = first(batch),
+    genotype = first(genotype),
+    .groups = "drop"
+  )
+
+sample_manifest <- sample_meta_one %>%
+  left_join(sample_summary, by = "sample_id") %>%
+  left_join(sample_x_cluster_counts, by = "sample_id") %>%
+  left_join(sample_x_state_counts, by = "sample_id")
+
+fn_sample_manifest <- file.path(outdir, "sample_manifest.csv")
+fn_sample_x_cluster <- file.path(outdir, "sample_x_cluster_counts.csv")
+fn_sample_x_state <- file.path(outdir, "sample_x_state_counts.csv")
+
+write_csv(sample_manifest, fn_sample_manifest)
+write_csv(sample_x_cluster_counts, fn_sample_x_cluster)
+write_csv(sample_x_state_counts, fn_sample_x_state)
+
+log_msg("Wrote sample manifest and count matrices:\n - ", fn_sample_manifest, "\n - ", fn_sample_x_cluster, "\n - ", fn_sample_x_state)
+
+# --------- 7. Eligibility decisions for sample×unit ----------
+min_eligible <- 10
+min_good <- 20
+
+wide_to_long <- function(wide_df, unit_name = "unit") {
+  wide_df %>%
+    pivot_longer(-sample_id, names_to = unit_name, values_to = "n_cells")
+}
+
+sample_cluster_long <- wide_to_long(sample_x_cluster_counts, unit_name = "mg_cluster") %>%
+  mutate(unit_type = "cluster",
+         eligibility = case_when(
+           n_cells >= min_good ~ "good",
+           n_cells >= min_eligible ~ "eligible",
+           TRUE ~ "too_few"
+         ))
+
+sample_state_long <- wide_to_long(sample_x_state_counts, unit_name = "MG_STATE_assigned") %>%
+  mutate(unit_type = "state",
+         eligibility = case_when(
+           n_cells >= min_good ~ "good",
+           n_cells >= min_eligible ~ "eligible",
+           TRUE ~ "too_few"
+         ))
+
+sample_unit_eligibility <- bind_rows(sample_cluster_long, sample_state_long) %>%
+  arrange(unit_type, sample_id, desc(n_cells))
+
+fn_sample_unit_elig <- file.path(outdir, "sample_unit_eligibility.csv")
+write_csv(sample_unit_eligibility, fn_sample_unit_elig)
+log_msg("Wrote sample_unit_eligibility: ", fn_sample_unit_elig)
+
+# --------- 8. Identify low-representation units & sample-driven clusters ----------
+min_eligible <- 10
+
+cluster_sample_geno_counts <- meta_df %>%
+  count(mg_cluster, sample_id, genotype, name = "n_cells") %>%
+  mutate(is_eligible = n_cells >= min_eligible) %>%
+  group_by(mg_cluster, genotype) %>%
+  summarise(n_samples_eligible = sum(is_eligible), .groups = "drop")
+
+clusters_few_samples <- cluster_sample_geno_counts %>%
+  filter(n_samples_eligible < 3) %>%
+  arrange(mg_cluster, genotype)
+
+state_sample_geno_counts <- meta_df %>%
+  mutate(MG_STATE_assigned = ifelse(is.na(MG_STATE_assigned), "Unassigned", MG_STATE_assigned)) %>%
+  count(MG_STATE_assigned, sample_id, genotype, name = "n_cells") %>%
+  mutate(is_eligible = n_cells >= min_eligible) %>%
+  group_by(MG_STATE_assigned, genotype) %>%
+  summarise(n_samples_eligible = sum(is_eligible), .groups = "drop")
+
+states_few_samples <- state_sample_geno_counts %>%
+  filter(n_samples_eligible < 3) %>%
+  arrange(MG_STATE_assigned, genotype)
+
+cluster_sample_frac <- meta_df %>%
+  count(mg_cluster, sample_id, name = "n_cells") %>%
+  group_by(mg_cluster) %>%
+  mutate(total_cells = sum(n_cells), frac = n_cells / total_cells) %>%
+  ungroup()
+
+sample_driven_clusters <- cluster_sample_frac %>%
+  filter(frac > 0.80) %>%
+  arrange(desc(frac))
+
+fn_clusters_few_samples <- file.path(outdir, "clusters_few_samples_per_genotype.csv")
+fn_states_few_samples   <- file.path(outdir, "states_few_samples_per_genotype.csv")
+fn_sample_driven        <- file.path(outdir, "clusters_sample_driven.csv")
+
+write_csv(clusters_few_samples, fn_clusters_few_samples)
+write_csv(states_few_samples, fn_states_few_samples)
+write_csv(sample_driven_clusters, fn_sample_driven)
+
+log_msg("Wrote diagnostics:\n - ", fn_clusters_few_samples, "\n - ", fn_states_few_samples, "\n - ", fn_sample_driven)
+
+# --------- 9. Export per_cell_metadata.csv (canonical) ----------
+meta_out <- obj@meta.data %>% as.data.frame() %>% tibble::rownames_to_column(var = "cell_barcode")
+scoreV2_cols <- grep("^scoreV2_", colnames(meta_out), value = TRUE)
+
+percell_cols <- c(
+  "cell_barcode",
+  "sample_id",
+  "mg_cluster",
+  "MG_STATE_assigned",
+  "MG_STATE_confidence",
+  "MG_STATE_delta_z",
+  "genotype",
+  "batch",
+  "nCount_RNA",
+  "percent.mt",
+  scoreV2_cols
+)
+
+existing_cols <- intersect(percell_cols, colnames(meta_out))
+missing_cols  <- setdiff(percell_cols, colnames(meta_out))
+if (length(missing_cols) > 0) {
+  log_msg("Note: omitted missing per-cell columns: ", paste(missing_cols, collapse = ", "))
+}
+
+per_cell_metadata <- meta_out %>% select(all_of(existing_cols))
+fn_percell <- file.path(outdir, "per_cell_metadata.csv")
+write_csv(per_cell_metadata, fn_percell)
+log_msg("Wrote per_cell_metadata: ", fn_percell)
+
+# --------- 10. Save final Seurat object ----------
+fn_rds_final <- output_rds
+saveRDS(obj, fn_rds_final, compress = "xz")
+log_msg("Saved final Seurat object to: ", fn_rds_final)
+
+# --------- 11. Final summaries ----------
+log_msg("\nCluster -> MG_STATE summary (first rows):")
+print(head(cluster_to_state_df %>% select(cluster, assigned_state, top_mean_z, delta_z, conf_level, n_cells_in_cluster)))
+
+log_msg("\nPer-cell MG_STATE distribution:")
+print(table(obj@meta.data$MG_STATE_assigned, useNA = "ifany"))
+
+log_msg("\nAll outputs written to: ", normalizePath(outdir))
+
+#########################                      
+#VISUALS FOR THE MG_STATES
+##########################
+
+# Generic plotting utilities for state-assigned single-cell datasets
+# Drop into your GitHub script. Requires: Seurat, ggplot2, dplyr, tidyr, readr, patchwork, viridis, cowplot
+# Example usage (after loading mg or meta_df):
+# plot_umap_states(mg, outdir = outdir)
+# plot_sample_state_tile(meta_df, outdir = outdir)
+# plot_sample_composition_stacked(meta_df, outdir = outdir)
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(patchwork)
+library(viridis)
+library(cowplot)
+
+# --------------------------
+# Helper: save PNG (high-res) + PDF (vector)
+# --------------------------
+save_both <- function(plot_obj, fname_base, outdir = ".", width = 6, height = 6, png_dpi = 600) {
+  if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+  png_file <- file.path(outdir, paste0(fname_base, ".png"))
+  pdf_file <- file.path(outdir, paste0(fname_base, ".pdf"))
+  ggsave(png_file, plot = plot_obj, width = width, height = height, dpi = png_dpi, bg = "white")
+  ggsave(pdf_file, plot = plot_obj, width = width, height = height, device = cairo_pdf)
+  message("Wrote: ", png_file, " and ", pdf_file)
+  invisible(list(png = png_file, pdf = pdf_file))
+}
+
+# --------------------------
+# Default palettes (change as desired when calling)
+# --------------------------
+default_state_colors <- c(
+  "Homeostatic" = "#1f78b4",
+  "Activated"   = "#ff7f00",
+  "DAM"         = "#6a3d9a",
+  "Unassigned"  = "#bdbdbd"
+)
+
+default_geno_colors <- c(
+  "AA" = "#D55E00",   # your preferred AA color
+  "GG" = "#0072B2"    # your preferred GG color
+)
+
+# --------------------------
+# Theme: journal-like, no gridlines
+# --------------------------
+theme_journal <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank(),
+      legend.key = element_rect(fill = "transparent", colour = NA),
+      legend.background = element_rect(fill = "transparent"),
+      plot.title = element_text(size = base_size + 2, face = "bold")
+    )
+}
+
+# --------------------------
+# Function: plot_umap_states
+# - input: Seurat object OR a data.frame with UMAP_1/UMAP_2 + state + genotype
+# - main outputs: p_umap_all, p_umap_split (returns a list)
+# --------------------------
+plot_umap_states <- function(x,
+                             state_col = "MG_STATE_assigned",
+                             genotype_col = "genotype",
+                             outdir = ".",
+                             fname_base_all = "UMAP_states_all",
+                             fname_base_split = "UMAP_states_split_by_genotype",
+                             state_colors = default_state_colors,
+                             genotype_colors = default_geno_colors,
+                             point_size = 0.6,
+                             point_alpha = 0.6,
+                             png_dpi = 600,
+                             width_all = 6, height_all = 6,
+                             width_split = 12, height_split = 6) {
+
+  # Build a metadata data.frame with UMAP coords
+  if (inherits(x, "Seurat")) {
+    if (!"umap" %in% names(x@reductions)) stop("Seurat object has no 'umap' reduction.")
+    emb <- Embeddings(x, "umap")
+    meta <- x@meta.data %>% tibble::rownames_to_column("cell_barcode")
+    umap_df <- as.data.frame(emb) %>%
+      tibble::rownames_to_column("cell_barcode") %>%
+      left_join(meta, by = "cell_barcode")
+    # ensure col names
+    colnames(umap_df)[which(colnames(umap_df) == colnames(emb)[1])] <- "UMAP_1"
+    colnames(umap_df)[which(colnames(umap_df) == colnames(emb)[2])] <- "UMAP_2"
+  } else if (is.data.frame(x)) {
+    umap_df <- x
+    if (!all(c("UMAP_1","UMAP_2") %in% colnames(umap_df))) stop("data.frame must contain UMAP_1 and UMAP_2 columns.")
+  } else {
+    stop("x must be a Seurat object or a data.frame with UMAP_1/UMAP_2.")
+  }
+
+  # Prepare columns
+  if (!state_col %in% colnames(umap_df)) {
+    stop(paste0("State column '", state_col, "' not found in metadata."))
+  }
+  if (!genotype_col %in% colnames(umap_df)) {
+    umap_df[[genotype_col]] <- NA_character_
+  }
+
+  umap_df <- umap_df %>%
+    mutate(
+      !!state_col := ifelse(is.na(.data[[state_col]]), "Unassigned", as.character(.data[[state_col]])),
+      !!genotype_col := ifelse(is.na(.data[[genotype_col]]), "NA", as.character(.data[[genotype_col]]))
+    )
+
+  # factor ordering: preserve provided state_colors names order if possible
+  present_states <- unique(umap_df[[state_col]])
+  ordered_states <- intersect(names(state_colors), present_states)
+  other_states <- setdiff(present_states, ordered_states)
+  state_levels <- c(ordered_states, sort(other_states))
+  umap_df[[state_col]] <- factor(umap_df[[state_col]], levels = state_levels)
+
+  # Full UMAP (all cells)
+  p_umap_all <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, color = .data[[state_col]])) +
+    geom_point(size = point_size, alpha = point_alpha, stroke = 0) +
+    scale_color_manual(values = state_colors, na.value = "#bdbdbd") +
+    labs(color = "STATE") +
+    theme_journal() +
+    theme(legend.position = "right")
+
+  # Split by genotype (only genotypes present will be faceted)
+  umap_split_df <- umap_df %>% filter(.data[[genotype_col]] %in% names(genotype_colors))
+  if (nrow(umap_split_df) == 0) {
+    warning("No cells with genotypes matching genotype_colors; split-by-genotype plot will be empty.")
+    p_umap_split <- NULL
+  } else {
+    p_umap_split <- ggplot(umap_split_df, aes(x = UMAP_1, y = UMAP_2, color = .data[[state_col]])) +
+      geom_point(size = point_size, alpha = point_alpha, stroke = 0) +
+      facet_wrap(as.formula(paste("~", genotype_col)), nrow = 1) +
+      scale_color_manual(values = state_colors, na.value = "#bdbdbd") +
+      theme_journal() +
+      theme(strip.text = element_text(size = 12), legend.position = "right")
+  }
+
+  # Save to disk
+  save_both(p_umap_all, fname_base_all, outdir = outdir, width = width_all, height = height_all, png_dpi = png_dpi)
+  if (!is.null(p_umap_split)) {
+    save_both(p_umap_split, fname_base_split, outdir = outdir, width = width_split, height = height_split, png_dpi = png_dpi)
+  }
+
+  invisible(list(umap_all = p_umap_all, umap_split = p_umap_split, umap_df = umap_df))
+}
+
+# --------------------------
+# Function: plot_sample_state_tile
+# - sample_id_col: column name for sample IDs
+# - state_col: column name for state assignment
+# - fills cells by log10(n+1); annotates raw counts (hide zeros)
+# --------------------------
+plot_sample_state_tile <- function(meta_df,
+                                   sample_id_col = "sample_id",
+                                   state_col = "MG_STATE_assigned",
+                                   outdir = ".",
+                                   fname_base = "sample_by_state_tile_log10_counts",
+                                   state_colors = default_state_colors,
+                                   palette_option = "magma",
+                                   png_dpi = 600,
+                                   width = 6.5, height = 6) {
+
+  # validate
+  if (!sample_id_col %in% colnames(meta_df)) stop("sample_id_col not found in meta_df")
+  if (!state_col %in% colnames(meta_df)) stop("state_col not found in meta_df")
+
+  df <- meta_df %>%
+    mutate(!!state_col := ifelse(is.na(.data[[state_col]]), "Unassigned", as.character(.data[[state_col]]))) %>%
+    count(.data[[sample_id_col]], .data[[state_col]], name = "n") %>%
+    tidyr::complete(!!rlang::sym(sample_id_col), !!rlang::sym(state_col),
+                    fill = list(n = 0))
+
+  # compute log10(n+1)
+  df <- df %>%
+    mutate(log10_n1 = log10(n + 1))
+
+  # order samples grouped by genotype if present (attempt to use genotype column if exists)
+  if ("genotype" %in% colnames(meta_df)) {
+    sample_order_df <- meta_df %>%
+      group_by(.data[[sample_id_col]]) %>%
+      summarise(total_cells = n(), genotype = first(genotype), .groups = "drop") %>%
+      arrange(genotype, desc(total_cells))
+    sample_order <- sample_order_df[[sample_id_col]]
+  } else {
+    sample_order <- df %>% group_by(.data[[sample_id_col]]) %>% summarise(total = sum(n)) %>% arrange(desc(total)) %>% pull(!!rlang::sym(sample_id_col))
+  }
+
+  df[[sample_id_col]] <- factor(df[[sample_id_col]], levels = sample_order)
+  state_levels <- unique(df[[state_col]])
+  df[[state_col]] <- factor(df[[state_col]], levels = state_levels)
+
+  p_tile <- ggplot(df, aes_string(x = state_col, y = sample_id_col, fill = "log10_n1")) +
+    geom_tile(color = NA) +
+    geom_text(aes(label = ifelse(n > 0, n, "")), size = 3) +
+    scale_fill_viridis_c(option = palette_option, na.value = "grey90", name = "log10(n+1)") +
+    labs(x = "", y = "") +
+    theme_journal(10) +
+    theme(axis.text.y = element_text(size = 9), axis.text.x = element_text(size = 10), legend.position = "right")
+
+  save_both(p_tile, fname_base, outdir = outdir, width = width, height = height, png_dpi = png_dpi)
+  invisible(list(plot = p_tile, df = df))
+}
+
+# --------------------------
+# Function: plot_sample_composition_stacked
+# - stacked composition per sample (proportion), with genotype strip above (expects 'genotype' column in meta_df)
+# --------------------------
+plot_sample_composition_stacked <- function(meta_df,
+                                           sample_id_col = "sample_id",
+                                           state_col = "MG_STATE_assigned",
+                                           genotype_col = "genotype",
+                                           outdir = ".",
+                                           fname_base = "sample_composition_by_state_stacked",
+                                           state_colors = default_state_colors,
+                                           genotype_colors = default_geno_colors,
+                                           png_dpi = 600,
+                                           width = 10, height = 5) {
+  # validate
+  if (!sample_id_col %in% colnames(meta_df)) stop("sample_id_col not found in meta_df")
+  if (!state_col %in% colnames(meta_df)) stop("state_col not found in meta_df")
+  if (!genotype_col %in% colnames(meta_df)) stop("genotype_col not found in meta_df")
+
+  df <- meta_df %>%
+    mutate(!!state_col := ifelse(is.na(.data[[state_col]]), "Unassigned", as.character(.data[[state_col]])),
+           !!genotype_col := ifelse(is.na(.data[[genotype_col]]), "NA", as.character(.data[[genotype_col]]))) %>%
+    group_by(.data[[sample_id_col]], .data[[genotype_col]], .data[[state_col]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(.data[[sample_id_col]]) %>%
+    mutate(prop = n / sum(n)) %>%
+    ungroup()
+
+  # Order samples by genotype blocks; within genotype by Homeostatic proportion if present
+  sample_order_df <- df %>%
+    group_by(.data[[sample_id_col]]) %>%
+    summarise(total = sum(n), genotype = first(.data[[genotype_col]]), .groups = "drop")
+
+  homeo_df <- df %>% filter(.data[[state_col]] == "Homeostatic") %>% select(.data[[sample_id_col]], prop) %>% rename(homeo_prop = prop)
+  sample_order2 <- sample_order_df %>%
+    left_join(homeo_df, by = sample_id_col) %>%
+    arrange(genotype, desc(homeo_prop)) %>%
+    pull(!!rlang::sym(sample_id_col))
+
+  # ensure ordering includes all samples
+  sample_order2 <- unique(c(sample_order2, sample_order_df[[sample_id_col]]))
+
+  df[[sample_id_col]] <- factor(df[[sample_id_col]], levels = sample_order2)
+  df[[state_col]] <- factor(df[[state_col]], levels = unique(df[[state_col]]))
+
+  # Stacked bar (proportions)
+  p_bar <- ggplot(df, aes_string(x = sample_id_col, y = "prop", fill = state_col)) +
+    geom_bar(stat = "identity", position = "fill", width = 0.8, color = NA) +
+    scale_fill_manual(values = state_colors) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(x = "", y = "Proportion", fill = "STATE") +
+    theme_journal(10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9), legend.position = "right")
+
+  # genotype strip (top)
+  sample_geno_df <- sample_order_df %>%
+    select(all_of(sample_id_col), genotype) %>%
+    mutate(!!sample_id_col := factor(!!rlang::sym(sample_id_col), levels = sample_order2),
+           genotype = factor(genotype, levels = names(genotype_colors)))
+
+  # ensure genotype_colors only contains keys present in sample_geno_df
+  present_genos <- intersect(names(genotype_colors), unique(as.character(sample_geno_df$genotype)))
+  geno_palette <- genotype_colors[present_genos]
+
+  p_geno_strip <- ggplot(sample_geno_df, aes_string(x = sample_id_col, y = 1, fill = "genotype")) +
+    geom_tile() +
+    scale_fill_manual(values = geno_palette, na.value = "#999999") +
+    theme_void() +
+    theme(legend.position = "none")
+
+  combined <- p_geno_strip + p_bar + plot_layout(ncol = 1, heights = c(0.07, 0.93))
+
+  save_both(combined, fname_base, outdir = outdir, width = width, height = height, png_dpi = png_dpi)
+  invisible(list(plot = combined, df = df))
+}
+
+# --------------------------
+# End of utilities
+# --------------------------
+# Example wrapper (uncomment to run in your script):
+# meta_df <- mg@meta.data %>% tibble::rownames_to_column("cell_barcode")
+# plot_umap_states(mg, outdir = outdir)
+# plot_sample_state_tile(meta_df, outdir = outdir)
+# plot_sample_composition_stacked(meta_df, outdir = outdir)
+                                            
 ########################
 # 13. MANIFEST & DONE
 ########################

@@ -3,6 +3,7 @@
 #
 # QC + integration + marker-based scoring for sc/snRNA data on Minerva:
 #   - Per-sample QC (mito/ribo filters, MAD-based nFeature/nCount)
+#### after insepction adjusted parameters- removal of MAD based technique (too stringent) and replaced with lenient paramters, additonally removal of ribosomal filter
 #   - Doublet detection using scDblFinder
 #   - Restrict to protein-coding genes (from GTF)
 #   - SCT-based integration across samples
