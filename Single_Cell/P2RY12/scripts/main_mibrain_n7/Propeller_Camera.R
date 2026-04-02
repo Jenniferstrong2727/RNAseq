@@ -1,0 +1,975 @@
+############################################################
+###Developed on the miBrain (iPSC model subset for microglia)
+# Microglia Pseudobulk:  abundance (Propeller) & gene-set (CAMERA) analysis
+#
+# Overview:
+#   1. Cluster-level abundance (Propeller; PC8 / res0.1)
+#   2. State-level abundance (Propeller; Homeostatic vs DAM)
+#   3. Gene-set testing (CAMERA; AA vs GG)
+#
+# Dependencies in the current R session:
+#   - microglia_subset : Seurat object with meta.data columns:
+#         sample_id, micro_pc8_res0.1, genotype, batch
+#   - dge_global         : edgeR::DGEList of microglia pseudobulk (AA vs GG)
+#   - sample_meta_ordered: sample-level metadata for dge_global
+#   - out_dir (optional) : base output directory; defaults to getwd()
+#
+# Notes:
+#   - Genotype labels are standardized to "GG" / "AA".
+#   - Propeller-style tests use asin(sqrt(prop)) and limma with
+#     weights proportional to sqrt(total cells per sample).
+############################################################
+
+
+########################
+# 01. Load packages
+########################
+# Load all required libraries once at the top of the script.
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(limma)
+  library(edgeR)
+  library(readr)
+  library(glue)
+  library(tibble)
+  library(forcats)
+})
+
+
+
+########################
+# 02. Helper functions
+########################
+# Small utilities for genotype cleaning, CAMERA indices, and
+# a generic Propeller-style limma wrapper.
+
+
+# 2.1 Standardize genotype labels to "GG" / "AA"
+# ------------------------------------------------
+# Accepts character or factor; returns character.
+standardize_genotype <- function(x) {
+  x_chr <- as.character(x)
+  dplyr::case_when(
+    x_chr %in% c("GG", "G/G", "G_G", "G") ~ "GG",
+    x_chr %in% c("AA", "A/A", "A_A", "A") ~ "AA",
+    TRUE ~ x_chr
+  )
+}
+
+
+# 2.2 Build CAMERA index list from a list of gene vectors
+# -------------------------------------------------------
+# gene_sets: named list of character vectors (gene symbols).
+# genes    : character vector of gene symbols (universe).
+# Returns a named list of integer indices suitable for limma::camera().
+make_camera_index <- function(gene_sets, genes) {
+  genes_up <- toupper(genes)
+  idx_list <- lapply(gene_sets, function(gs) {
+    gs_up <- unique(toupper(gs))
+    which(genes_up %in% gs_up)
+  })
+  
+  empty_sets <- names(idx_list)[vapply(idx_list, length, 1L) == 0]
+  if (length(empty_sets) > 0) {
+    message(
+      "CAMERA: these sets had no genes in the universe and were dropped: ",
+      paste(empty_sets, collapse = ", ")
+    )
+    idx_list <- idx_list[vapply(idx_list, length, 1L) > 0]
+  }
+  idx_list
+}
+
+
+# 2.3 Run Propeller-style limma on asin(sqrt(prop))
+# --------------------------------------------------
+# prop_mat_prop          : matrix of proportions (features x samples)
+# sample_meta           : data.frame with one row per sample
+# design_formula        : formula, e.g. ~ genotype + batch
+# coef_name             : column name in design matrix, e.g. "genotypeAA"
+# total_cells_per_sample: named numeric vector, names = sample IDs
+#
+# Returns a list with:
+#   - fit      : eBayes limma fit object
+#   - design   : design matrix
+#   - results  : data.frame with feature, coef, t, p.value, FDR
+run_propeller_limma <- function(prop_mat_prop,
+                                sample_meta,
+                                design_formula,
+                                coef_name,
+                                total_cells_per_sample) {
+  # arcsin√ transform
+  trans_prop <- asin(sqrt(prop_mat_prop))
+  
+  # weights = sqrt(total cells per sample)
+  tot_vec2 <- total_cells_per_sample[
+    match(colnames(prop_mat_prop), names(total_cells_per_sample))
+  ]
+  w_vec <- sqrt(as.numeric(tot_vec2))
+  weights_mat <- matrix(
+    rep(w_vec, each = nrow(trans_prop)),
+    nrow = nrow(trans_prop),
+    byrow = FALSE,
+    dimnames = dimnames(trans_prop)
+  )
+  
+  # limma design and fit
+  design <- model.matrix(design_formula, data = sample_meta)
+  if (!coef_name %in% colnames(design)) {
+    stop("Coefficient ", coef_name, " not found in design matrix.")
+  }
+  coef_idx <- which(colnames(design) == coef_name)
+  
+  fit <- lmFit(trans_prop, design = design, weights = weights_mat)
+  fit <- eBayes(fit)
+  
+  res <- data.frame(
+    feature = rownames(fit$coefficients),
+    coef    = fit$coefficients[, coef_idx],
+    t       = fit$t[, coef_idx],
+    p.value = fit$p.value[, coef_idx],
+    FDR     = p.adjust(fit$p.value[, coef_idx], method = "BH"),
+    stringsAsFactors = FALSE
+  )
+  
+  list(
+    fit      = fit,
+    design   = design,
+    results  = res
+  )
+}
+
+
+
+########################
+# 03. Microglia gene modules
+########################
+# Define:
+#   - state modules: Homeostatic vs DAM (for module scores / state calls)
+#   - curated modules for CAMERA (gene-set testing)
+#   - optional alternate MG sets (currently unused)
+
+
+# 3.1 Modules for state assignment (Homeostatic vs DAM)
+# -----------------------------------------------------
+# Used with Seurat::AddModuleScore to define microglia "state".
+microglia_state_modules <- list(
+  Homeostatic_Resolution = c(
+    "TMEM119", "SALL1", "OLFML3", "TYRO3", "TGFBR1", "TGFBR2",
+    "MERTK", "GAS6", "SPRY1", "IL10RA", "CD163"
+  ),
+  Activated_DAM = c(
+    "TREM2", "TYROBP", "APOE", "SPP1", "GPNMB", "LPL",
+    "CD68", "CST7", "CTSD", "CTSB", "LGALS3", "ITGAX"
+  )
+)
+
+
+# 3.2 Curated modules for CAMERA (AA vs GG pseudobulk)
+# ----------------------------------------------------
+# Some gene sets were combined or expanded for robustness given sparse detection.
+micro_modules_curated <- list(
+  Homeostatic_Protective = c(
+    "TMEM119","SALL1","CX3CR1","CSF1R",
+    "GPR34","FCRLS","OLFML3",
+    "MEF2C","ADGRG1","P2RY13","TYRO3",
+    "TGFB1","TGFBR1","GAS6","MFGE8","CD47",
+    "IL10","CD163"
+  ),
+  Activated_APC = c(
+    "AIF1","CD68","CD74","HLA-DRA","HLA-DRB1",
+    "ITGAM","ITGB2","CD40","CD86","CD14",
+    "LGALS3","LYZ2","CSTB","CIITA"
+  ),
+  Inflam_Cyto = c(
+    "IL1B","IL6","TNF","NLRP3","CASP1","PYCARD","IL18",
+    "CCL2","CCL5","CXCL10","CXCR4",
+    "NFKB1","RELA","IKBKB",
+    "IRF8","IRF9","TLR2","TLR4",
+    "NOS2","HMGB1","HSPB1","HSPD1"
+  ),
+  Interferon = c(
+    "IFITM3","IFI27","IFIT1","IFIT2","IFIT3","ISG15",
+    "IRF7","OASL","GBP2","MX1","MX2",
+    "IFNB1","IFNA1","STAT1","TNFSF10","RSAD2"
+  ),
+  DAM = c(
+    "APOE","TREM2","LPL","ITGAX","CST7",
+    "CLU","TMEM163","CD44","CD9"
+  ),
+  Clearance = c(
+    "MERTK","AXL","GULP1","PROS1","CD36","FCGR3A",
+    "LAMP1","LAMP2","CTSB","CTSD","CTSL",
+    "GBA","SCARB2","NPC1","NPC2","TFEB","PSAP",
+    "MAP1LC3B","BECN1","SQSTM1","ATG5","ATG7","ULK1","WDR45"
+  ),
+  LDAM = c(
+    "PLIN2","CIDEC","G0S2","FADS2","SOAT1",
+    "ABCA1","LRP1","APOC1","SORT1"
+  )
+)
+
+
+# 3.3 Optional alternate microglia gene sets (currently unused)
+# -------------------------------------------------------------
+MG_sets <- list(
+  Homeostatic_core = c(
+    "TMEM119","SALL1","OLFML3","TYRO3","CX3CR1","FCRLS"
+  ),
+  DAM_core = c(
+    "TREM2","TYROBP","APOE","SPP1","GPNMB","LPL"
+  ),
+  Inflammation_NFkB = c(
+    "IL1B","TNF","NLRP3","CASP1","PYCARD","IL18"
+  ),
+  Phagocytosis_core = c(
+    "ITGAM","MERTK","AXL","CD36","ITGB2","ITGAX"
+  ),
+  Lysosomal_enzymes = c(
+    "LAMP1","LAMP2","CTSB","CTSD","CTSL","HEXB"
+  )
+)
+
+
+
+########################
+# 04. Configuration & output directories
+########################
+# Define Seurat object, metadata columns, and output paths.
+
+
+# 4.1 Set base output dir (optional override via existing out_dir)
+# ----------------------------------------------------------------
+if (!exists("out_dir")) {
+  out_dir <- getwd()
+}
+
+# Primary Seurat object
+mic <- microglia_subset
+
+# Meta columns for cluster-level Propeller
+sample_col_cluster  <- "sample_id"
+cluster_col         <- "micro_pc8_res0.1"
+
+# Output subdirectories
+prop_out_dir_cluster <- file.path(out_dir, "propeller_microglia_PC8_res0.1")
+prop_out_dir_state   <- file.path(out_dir, "propeller_microglia_STATE")
+camera_out_dir       <- file.path(out_dir, "camera_microglia_PC8_res0.1")
+
+dir.create(prop_out_dir_cluster, showWarnings = FALSE, recursive = TRUE)
+dir.create(prop_out_dir_state,   showWarnings = FALSE, recursive = TRUE)
+dir.create(camera_out_dir,       showWarnings = FALSE, recursive = TRUE)
+
+
+
+############################################################
+# 05. PROPELLER — cluster-level abundance (PC8 / res0.1)
+############################################################
+# Goal:
+#   - Compute cluster-wise proportions per sample.
+#   - Test AA vs GG (adjusting for batch) using Propeller-style limma.
+#   - Save full results (CSV + RDS) and a faceted abundance plot.
+############################################################
+
+
+# 5.1 Sanity checks and genotype standardization
+# ----------------------------------------------
+meta <- mic@meta.data
+meta_cols <- colnames(meta)
+stopifnot(sample_col_cluster %in% meta_cols)
+stopifnot(cluster_col        %in% meta_cols)
+stopifnot("genotype"         %in% meta_cols)
+
+meta[[sample_col_cluster]] <- as.character(meta[[sample_col_cluster]])
+meta[[cluster_col]]        <- as.character(meta[[cluster_col]])
+meta$genotype              <- standardize_genotype(meta$genotype)
+
+
+# 5.2 Build cluster × sample count matrix and per-sample totals
+# -------------------------------------------------------------
+# cluster_sample_long: one row per cluster-sample with cell counts.
+cluster_sample_long <- meta %>%
+  group_by(
+    cluster = .data[[cluster_col]],
+    sample  = .data[[sample_col_cluster]]
+  ) %>%
+  summarise(cells = dplyr::n(), .groups = "drop")
+
+samples_present  <- sort(unique(cluster_sample_long$sample))
+clusters_present <- sort(unique(cluster_sample_long$cluster))
+
+# counts matrix: clusters x samples
+prop_mat_cluster <- matrix(
+  0L,
+  nrow = length(clusters_present),
+  ncol = length(samples_present),
+  dimnames = list(clusters_present, samples_present)
+)
+
+for (s in samples_present) {
+  tmp <- cluster_sample_long %>% filter(sample == s)
+  if (nrow(tmp) > 0) {
+    prop_mat_cluster[as.character(tmp$cluster), s] <- tmp$cells
+  }
+}
+
+# total cells per sample
+per_sample_total_cluster <- meta %>%
+  group_by(sample = .data[[sample_col_cluster]]) %>%
+  summarise(total_cells = dplyr::n(), .groups = "drop")
+
+tot_vec_cluster <- per_sample_total_cluster$total_cells[
+  match(samples_present, per_sample_total_cluster$sample)
+]
+names(tot_vec_cluster) <- samples_present
+
+# proportions: clusters x samples
+prop_mat_cluster_prop <- sweep(prop_mat_cluster, 2, tot_vec_cluster, FUN = "/")
+
+
+# 5.3 Sample-level metadata for cluster analysis (GG / AA only)
+# -------------------------------------------------------------
+# Expecting `batch` column (e.g., "main", "pilot").
+sample_meta_cluster <- meta %>%
+  select(sample = !!sym(sample_col_cluster), genotype, batch) %>%
+  distinct()
+
+sample_meta_cluster$genotype <- standardize_genotype(sample_meta_cluster$genotype)
+sample_meta_cluster <- sample_meta_cluster %>%
+  filter(genotype %in% c("GG", "AA"))
+
+keep_samples_cluster <- intersect(samples_present, sample_meta_cluster$sample)
+prop_mat_cluster_prop <- prop_mat_cluster_prop[, keep_samples_cluster, drop = FALSE]
+
+sample_meta_cluster <- sample_meta_cluster %>%
+  filter(sample %in% keep_samples_cluster) %>%
+  arrange(match(sample, colnames(prop_mat_cluster_prop)))
+
+sample_meta_cluster$genotype <- factor(sample_meta_cluster$genotype,
+                                       levels = c("GG", "AA"))
+sample_meta_cluster$batch    <- factor(sample_meta_cluster$batch,
+                                       levels = c("main", "pilot"))
+
+
+# 5.4 Propeller-style limma (asin√ prop ~ genotype + batch)
+## however batch was removed for this analysis due to pilot samples being removed
+# ---------------------------------------------------------
+propeller_cluster <- run_propeller_limma(
+  prop_mat_prop          = prop_mat_cluster_prop,
+  sample_meta            = sample_meta_cluster,
+  design_formula         = ~ genotype + batch,
+  coef_name              = "genotypeAA",
+  total_cells_per_sample = tot_vec_cluster
+)
+
+prop_res_cluster <- propeller_cluster$results %>%
+  rename(cluster = feature)
+
+
+# 5.5 Per-cluster mean ± SE on original proportion scale
+# ------------------------------------------------------
+prop_df_cluster <- as.data.frame(t(prop_mat_cluster_prop))
+prop_df_cluster$sample <- rownames(prop_df_cluster)
+
+prop_df_cluster <- prop_df_cluster %>%
+  pivot_longer(
+    cols      = -sample,
+    names_to  = "cluster",
+    values_to = "prop"
+  ) %>%
+  left_join(sample_meta_cluster, by = "sample")
+
+summary_tbl_cluster <- prop_df_cluster %>%
+  group_by(cluster, genotype) %>%
+  summarise(
+    mean_prop = mean(prop, na.rm = TRUE),
+    sd_prop   = sd(prop,   na.rm = TRUE),
+    n         = dplyr::n(),
+    se_prop   = sd_prop / sqrt(pmax(1, n)),
+    .groups   = "drop"
+  ) %>%
+  pivot_wider(
+    names_from  = genotype,
+    values_from = c(mean_prop, sd_prop, se_prop, n),
+    names_sep   = "_"
+  )
+
+res_full_cluster <- prop_res_cluster %>%
+  left_join(summary_tbl_cluster, by = "cluster") %>%
+  mutate(delta_AA_minus_GG = mean_prop_AA - mean_prop_GG) %>%
+  arrange(as.numeric(as.character(cluster)))
+
+
+# 5.6 Save cluster-level results (CSV + RDS)
+# ------------------------------------------
+csv_cluster_path <- file.path(
+  prop_out_dir_cluster,
+  "microglia_propeller_PC8_res0.1_results.csv"
+)
+write_csv(res_full_cluster, csv_cluster_path)
+message("✓ Wrote cluster abundance results to: ", normalizePath(csv_cluster_path))
+
+propeller_results_cluster <- list(
+  proportions_matrix = prop_mat_cluster_prop,   # clusters x samples (proportions)
+  proportions_long   = prop_df_cluster,         # long-format table
+  sample_meta        = sample_meta_cluster,
+  limma_design       = propeller_cluster$design,
+  limma_fit          = propeller_cluster$fit,
+  results_table      = res_full_cluster,
+  metadata = list(
+    clusters    = clusters_present,
+    created_on  = Sys.time(),
+    r_version   = R.version$version.string,
+    out_dir     = prop_out_dir_cluster
+  )
+)
+
+rds_cluster_path <- file.path(
+  prop_out_dir_cluster,
+  "microglia_propeller_PC8_res0.1_results.rds"
+)
+saveRDS(propeller_results_cluster, rds_cluster_path, compress = "xz")
+message("✓ Saved cluster-level propeller RDS to: ", normalizePath(rds_cluster_path))
+
+
+# 5.7 Plot: cluster-level abundance (numeric-ordered facets)
+# ----------------------------------------------------------
+# Per-sample points and mean ± SE, faceted by numeric cluster labels.
+gen_colors <- c("GG" = "#1f78b4", "AA" = "#d95f02")
+shape_map  <- c("main" = 16, "pilot" = 17)
+base_size  <- 14
+
+prop_df_cluster_plot <- prop_df_cluster %>%
+  mutate(
+    cluster_num = as.numeric(as.character(cluster)),
+    cluster     = factor(cluster_num, levels = sort(unique(cluster_num))),
+    genotype    = factor(genotype, levels = c("GG", "AA")),
+    batch       = factor(batch,    levels = c("main", "pilot"))
+  )
+
+p_abund_num <- ggplot(
+  prop_df_cluster_plot,
+  aes(x = genotype, y = prop, color = genotype, shape = batch)
+) +
+  geom_jitter(
+    position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.4),
+    size = 3,
+    alpha = 0.95
+  ) +
+  stat_summary(
+    fun.data = function(x) {
+      y  <- mean(x, na.rm = TRUE)
+      se <- sd(x, na.rm = TRUE) / sqrt(max(1, length(na.omit(x))))
+      data.frame(y = y, ymin = y - se, ymax = y + se)
+    },
+    geom = "errorbar",
+    width = 0.12,
+    color = "black",
+    position = position_dodge(width = 0.4)
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 23,
+    size = 3.5,
+    fill = "black",
+    color = "black",
+    position = position_dodge(width = 0.4)
+  ) +
+  scale_color_manual(values = gen_colors, name = "Genotype") +
+  scale_shape_manual(values = shape_map,  name = "Batch") +
+  facet_wrap(~ cluster, nrow = 1, scales = "fixed") +
+  labs(
+    x = "Genotype",
+    y = "Proportion (per-sample)",
+    title = NULL
+  ) +
+  theme_classic(base_size = base_size) +
+  theme(
+    panel.grid   = element_blank(),
+    axis.title   = element_text(size = base_size),
+    axis.text    = element_text(size = base_size - 2),
+    strip.text   = element_text(size = base_size - 1),
+    legend.title = element_text(size = base_size - 1),
+    legend.text  = element_text(size = base_size - 2)
+  )
+
+nclus  <- length(levels(prop_df_cluster_plot$cluster))
+fig_w  <- max(8, 2.0 * nclus)
+fig_h  <- 3.4
+
+png_cluster_file <- file.path(
+  prop_out_dir_cluster,
+  "microglia_propeller_PC8_res0.1_abundance_facets_numeric.png"
+)
+pdf_cluster_file <- file.path(
+  prop_out_dir_cluster,
+  "microglia_propeller_PC8_res0.1_abundance_facets_numeric.pdf"
+)
+
+ggsave(png_cluster_file, plot = p_abund_num, width = fig_w, height = fig_h, dpi = 600)
+ggsave(pdf_cluster_file, plot = p_abund_num, width = fig_w, height = fig_h, device = cairo_pdf)
+
+message("✓ Saved cluster abundance figure to:\n  - ",
+        normalizePath(png_cluster_file), "\n  - ",
+        normalizePath(pdf_cluster_file))
+
+
+
+############################################################
+# 06. PROPELLER — state-level abundance (Homeostatic vs DAM)
+############################################################
+# Goal:
+#   - Assign each cell to Homeostatic_Res_state vs Activated_DAM_state
+#     using module scores (winner-take-all).
+#   - Compute per-sample state proportions.
+#   - Test AA vs GG (no batch) using Propeller-style limma.
+#   - Save summary table and abundance plot.
+############################################################
+
+
+# 6.1 Add module scores and assign states (winner-take-all)
+# ---------------------------------------------------------
+mic <- microglia_subset
+
+# Add module scores if not already present
+if (!any(grepl("^stateScore", colnames(mic@meta.data)))) {
+  mic <- AddModuleScore(
+    object   = mic,
+    features = microglia_state_modules,
+    name     = "stateScore"
+  )
+}
+
+# Identify and rename the two score columns
+score_cols <- grep("^stateScore", colnames(mic@meta.data), value = TRUE)
+if (length(score_cols) != 2) {
+  stop("Expected 2 stateScore columns, found: ", paste(score_cols, collapse = ", "))
+}
+
+colnames(mic@meta.data)[match(score_cols, colnames(mic@meta.data))] <-
+  c("stateScore_Homeostatic_Resolution", "stateScore_Activated_DAM")
+
+# Winner-take-all state assignment
+mic$state <- NA_character_
+mic$state[
+  mic$stateScore_Homeostatic_Resolution > mic$stateScore_Activated_DAM
+] <- "Homeostatic_Res_state"
+mic$state[
+  mic$stateScore_Activated_DAM >= mic$stateScore_Homeostatic_Resolution
+] <- "Activated_DAM_state"
+
+table(mic$state, useNA = "ifany")
+
+# Write back to global object
+microglia_subset <- mic
+
+
+# 6.2 Build state × sample counts and proportions
+# -----------------------------------------------
+mic_state    <- microglia_subset
+sample_col_s <- "sample_id"
+state_col    <- "state"
+
+meta_s <- mic_state@meta.data
+meta_cols_s <- colnames(meta_s)
+
+stopifnot(sample_col_s %in% meta_cols_s)
+stopifnot(state_col    %in% meta_cols_s)
+stopifnot("genotype"   %in% meta_cols_s)
+
+meta_s[[sample_col_s]] <- as.character(meta_s[[sample_col_s]])
+meta_s[[state_col]]    <- as.character(meta_s[[state_col]])
+meta_s$genotype        <- standardize_genotype(meta_s$genotype)
+
+# Keep GG / AA only
+meta_s <- meta_s %>%
+  filter(genotype %in% c("GG", "AA"))
+
+state_sample_long <- meta_s %>%
+  group_by(
+    state  = .data[[state_col]],
+    sample = .data[[sample_col_s]]
+  ) %>%
+  summarise(cells = dplyr::n(), .groups = "drop")
+
+samples_present_s <- sort(unique(state_sample_long$sample))
+states_present    <- sort(unique(state_sample_long$state))
+
+prop_mat_state <- matrix(
+  0L,
+  nrow = length(states_present),
+  ncol = length(samples_present_s),
+  dimnames = list(states_present, samples_present_s)
+)
+
+for (s in samples_present_s) {
+  tmp <- state_sample_long %>% filter(sample == s)
+  if (nrow(tmp) > 0) {
+    prop_mat_state[as.character(tmp$state), s] <- tmp$cells
+  }
+}
+
+# total cells per sample (all states)
+per_sample_total_state <- meta_s %>%
+  group_by(sample = .data[[sample_col_s]]) %>%
+  summarise(total_cells = dplyr::n(), .groups = "drop")
+
+tot_vec_state <- per_sample_total_state$total_cells[
+  match(samples_present_s, per_sample_total_state$sample)
+]
+names(tot_vec_state) <- samples_present_s
+
+prop_mat_state_prop <- sweep(prop_mat_state, 2, tot_vec_state, FUN = "/")
+
+
+# 6.3 Sample-level metadata (GG / AA only)
+# ----------------------------------------
+sample_meta_state <- meta_s %>%
+  select(sample = !!sym(sample_col_s), genotype) %>%
+  distinct()
+
+keep_samples_state <- intersect(samples_present_s, sample_meta_state$sample)
+prop_mat_state_prop <- prop_mat_state_prop[, keep_samples_state, drop = FALSE]
+
+sample_meta_state <- sample_meta_state %>%
+  filter(sample %in% keep_samples_state) %>%
+  arrange(match(sample, colnames(prop_mat_state_prop)))
+
+sample_meta_state$genotype <- factor(sample_meta_state$genotype,
+                                     levels = c("GG", "AA"))
+
+
+# 6.4 Propeller-style limma (asin√ prop ~ genotype)
+# -------------------------------------------------
+propeller_state <- run_propeller_limma(
+  prop_mat_prop          = prop_mat_state_prop,
+  sample_meta            = sample_meta_state,
+  design_formula         = ~ genotype,
+  coef_name              = "genotypeAA",
+  total_cells_per_sample = tot_vec_state
+)
+
+prop_res_state <- propeller_state$results %>%
+  rename(state = feature)
+
+
+# 6.5 Means ± SE per state × genotype (original scale)
+# ----------------------------------------------------
+prop_df_state <- as.data.frame(t(prop_mat_state_prop))
+prop_df_state$sample <- rownames(prop_df_state)
+
+prop_df_state <- prop_df_state %>%
+  pivot_longer(
+    cols      = -sample,
+    names_to  = "state",
+    values_to = "prop"
+  ) %>%
+  left_join(sample_meta_state, by = "sample")
+
+summary_tbl_state <- prop_df_state %>%
+  group_by(state, genotype) %>%
+  summarise(
+    mean_prop = mean(prop, na.rm = TRUE),
+    sd_prop   = sd(prop,   na.rm = TRUE),
+    n         = dplyr::n(),
+    se_prop   = sd_prop / sqrt(pmax(1, n)),
+    .groups   = "drop"
+  ) %>%
+  pivot_wider(
+    names_from  = genotype,
+    values_from = c(mean_prop, sd_prop, se_prop, n),
+    names_sep   = "_"
+  )
+
+res_full_state <- prop_res_state %>%
+  left_join(summary_tbl_state, by = "state") %>%
+  mutate(delta_AA_minus_GG = mean_prop_AA - mean_prop_GG) %>%
+  arrange(state)
+
+csv_state_path <- file.path(
+  prop_out_dir_state,
+  "microglia_propeller_STATE_results.csv"
+)
+write_csv(res_full_state, csv_state_path)
+message("✓ Wrote STATE abundance results to: ", normalizePath(csv_state_path))
+
+print(res_full_state)
+
+
+# 6.6 Plot: state-level abundance (Homeostatic vs DAM)
+# ----------------------------------------------------
+p_state <- ggplot(
+  prop_df_state,
+  aes(x = genotype, y = prop, color = genotype)
+) +
+  geom_jitter(
+    width = 0.12,
+    size  = 3,
+    alpha = 0.95
+  ) +
+  stat_summary(
+    fun.data = function(x) {
+      y  <- mean(x, na.rm = TRUE)
+      se <- sd(x, na.rm = TRUE) / sqrt(max(1, length(na.omit(x))))
+      data.frame(y = y, ymin = y - se, ymax = y + se)
+    },
+    geom = "errorbar",
+    width = 0.12,
+    color = "black",
+    position = position_dodge(width = 0.4)
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 23,
+    size  = 3.5,
+    fill  = "black",
+    color = "black",
+    position = position_dodge(width = 0.4)
+  ) +
+  scale_color_manual(values = gen_colors, name = "Genotype") +
+  facet_wrap(~ state, nrow = 1, scales = "fixed") +
+  labs(
+    x = "Genotype",
+    y = "Proportion (per-sample)",
+    title = NULL
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    panel.grid = element_blank()
+  )
+
+state_png <- file.path(
+  prop_out_dir_state,
+  "microglia_propeller_STATE_abundance.png"
+)
+state_pdf <- file.path(
+  prop_out_dir_state,
+  "microglia_propeller_STATE_abundance.pdf"
+)
+
+ggsave(state_png, plot = p_state, width = 6, height = 3.4, dpi = 600)
+ggsave(state_pdf, plot = p_state, width = 6, height = 3.4, device = cairo_pdf)
+
+message("✓ Saved STATE abundance figure to:\n  - ",
+        normalizePath(state_png), "\n  - ",
+        normalizePath(state_pdf))
+
+
+# 6.7 Nicely formatted state-level summary table (paper-ready)
+# ------------------------------------------------------------
+state_table <- res_full_state %>%
+  transmute(
+    State = state,
+    `GG mean ± SE` = glue(
+      "{sprintf('%.3f', mean_prop_GG)} ± {sprintf('%.3f', se_prop_GG)}"
+    ),
+    `AA mean ± SE` = glue(
+      "{sprintf('%.3f', mean_prop_AA)} ± {sprintf('%.3f', se_prop_AA)}"
+    ),
+    `Δ (AA − GG)` = sprintf("%+.3f", delta_AA_minus_GG),
+    `p-value`     = sprintf("%.3f", p.value),
+    FDR           = sprintf("%.3f", FDR)
+  )
+
+print(state_table)
+
+
+
+############################################################
+# 07. CAMERA — gene-set testing (AA vs GG pseudobulk; GG ref)
+############################################################
+# Goal:
+#   - Run CAMERA on pseudobulk microglia (dge_global) using
+#     curated microglia modules (micro_modules_curated).
+#   - Design: ~ genotype, contrast = AA vs GG (GG reference).
+#   - Save CAMERA table and generate a signed -log10(FDR) barplot.
+############################################################
+
+
+# 7.1 Sanity checks and attach sample metadata to DGEList
+# -------------------------------------------------------
+if (!exists("dge_global")) {
+  stop("dge_global does not exist. Run your global AA vs GG pseudobulk edgeR block first.")
+}
+if (!exists("sample_meta_ordered")) {
+  stop("sample_meta_ordered does not exist. Make sure the pseudobulk block was run.")
+}
+if (!exists("micro_modules_curated")) {
+  stop("micro_modules_curated (module list) is not defined.")
+}
+
+# Attach sample metadata to dge_global if needed
+if (!"genotype" %in% colnames(dge_global$samples)) {
+  if (!"sample" %in% colnames(sample_meta_ordered)) {
+    stop("sample_meta_ordered must contain a 'sample' column matching DGEList samples.")
+  }
+  dge_global$samples <- cbind(
+    dge_global$samples,
+    sample_meta_ordered[match(
+      rownames(dge_global$samples),
+      sample_meta_ordered$sample
+    ), , drop = FALSE]
+  )
+}
+
+# Standardize genotype labels and keep GG / AA only
+dge_global$samples$genotype <- standardize_genotype(dge_global$samples$genotype)
+
+keep_samples_cam <- dge_global$samples$genotype %in% c("GG", "AA")
+dge_global <- dge_global[, keep_samples_cam, keep.lib.sizes = FALSE]
+dge_global$samples <- droplevels(dge_global$samples[keep_samples_cam, , drop = FALSE])
+
+if (length(unique(dge_global$samples$genotype)) != 2) {
+  stop("After filtering, we do not have both GG and AA genotypes.")
+}
+
+dge_global$samples$genotype <- factor(
+  dge_global$samples$genotype,
+  levels = c("GG", "AA")
+)
+
+# Design: ~ genotype (coef for AA vs GG)
+design_global <- model.matrix(~ genotype, data = dge_global$samples)
+
+
+# 7.2 Filter lowly-expressed genes, normalize, voom
+# -------------------------------------------------
+keep_genes_cam <- rowSums(cpm(dge_global) > 1) >= 2
+dge_global_filt <- dge_global[keep_genes_cam, , keep.lib.sizes = FALSE]
+
+if (nrow(dge_global_filt) == 0) {
+  stop("No genes passed CPM filter for CAMERA.")
+}
+
+dge_global_filt <- calcNormFactors(dge_global_filt)
+
+v_global <- voom(dge_global_filt, design_global, plot = FALSE)
+
+
+# 7.3 Build CAMERA index from micro_modules_curated
+# -------------------------------------------------
+camera_index_global <- make_camera_index(
+  gene_sets = micro_modules_curated,
+  genes     = rownames(v_global$E)
+)
+
+if (length(camera_index_global) == 0) {
+  stop("No micro_modules_curated genes overlapped the voom gene universe.")
+}
+
+
+# 7.4 Contrast: AA vs GG (GG reference) and run CAMERA
+# ----------------------------------------------------
+if (!"genotypeAA" %in% colnames(design_global)) {
+  stop("No 'genotypeAA' column in design_global; check design.")
+}
+contr_global <- limma::makeContrasts(genotypeAA, levels = design_global)
+
+cam_global <- camera(
+  y        = v_global,
+  index    = camera_index_global,
+  design   = design_global,
+  contrast = contr_global,
+  sort     = TRUE
+)
+
+cam_global_tbl <- cam_global %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("module") %>%
+  arrange(PValue)
+
+
+# 7.5 Save CAMERA results table
+# -----------------------------
+out_cam_global_csv <- file.path(
+  camera_out_dir,
+  "camera_global_microglia_AA_vs_GG_microModules_GGref.csv"
+)
+write_csv(cam_global_tbl, out_cam_global_csv)
+
+message("✓ CAMERA (global AA vs GG, GG reference) written to: ",
+        normalizePath(out_cam_global_csv))
+
+cam_global_tbl
+
+
+# 7.6 CAMERA barplot: signed -log10(FDR) with direction
+# -----------------------------------------------------
+cam_plot_df <- cam_global_tbl %>%
+  mutate(
+    Direction_clean = ifelse(Direction == "Down",
+                             "Higher in G/G",
+                             "Higher in A/A"),
+    sign        = ifelse(Direction == "Up", 1, -1),
+    score       = sign * -log10(FDR),
+    sig_label   = case_when(
+      FDR < 0.05 ~ "***",
+      FDR < 0.10 ~ "*",
+      TRUE       ~ ""
+    ),
+    module      = forcats::fct_reorder(module, score)
+  )
+
+star_offset <- 0.15
+
+p_cam <- ggplot(cam_plot_df, aes(x = module, y = score, fill = Direction_clean)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.4) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  geom_text(
+    data = cam_plot_df %>% filter(sig_label != ""),
+    aes(
+      y = score + sign * star_offset,
+      label = sig_label
+    ),
+    size = 4.5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Higher in G/G" = "#4575b4",
+      "Higher in A/A" = "#d73027"
+    ),
+    name = NULL
+  ) +
+  labs(
+    x = NULL,
+    y = expression(paste("Signed -log"[10], "(FDR)")),
+    title = ""
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y  = element_text(face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 8)),
+    plot.title   = element_text(hjust = 0, face = "bold"),
+    legend.position = "top"
+  )
+
+print(p_cam)
+
+cam_pdf <- file.path(camera_out_dir, "camera_barplot_signed_log10FDR.pdf")
+cam_png <- file.path(camera_out_dir, "camera_barplot_signed_log10FDR.png")
+
+ggsave(
+  filename = cam_pdf,
+  plot     = p_cam,
+  width    = 5,
+  height   = 3.5
+)
+
+ggsave(
+  filename = cam_png,
+  plot     = p_cam,
+  width    = 5,
+  height   = 3.5,
+  dpi      = 300
+)
+
+message("✓ Saved CAMERA barplot to:\n  - ",
+        normalizePath(cam_pdf), "\n  - ",
+        normalizePath(cam_png))
