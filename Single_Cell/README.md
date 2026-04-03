@@ -1,30 +1,19 @@
-# RNA-seq Pipelines (MiBrain / Minerva)
+# Single-Cell RNA-seq Pipeline (MiBrain / Minerva)
 
-This repository contains end-to-end pipelines for **single-cell** and **bulk RNA-seq** analyses performed on the **Minerva HPC cluster**, with a focus on the **P2RY12 MiBrain project**.
-
----
-
-## Repository Overview
-
-* `Single_Cell/` — MiBrain single-cell RNA-seq preprocessing, integration, and downstream analyses
-* `Bulk/` — bulk RNA-seq processing, differential expression, and pathway analysis
+This directory contains the **single-cell RNA-seq analysis pipeline** for the MiBrain P2RY12 project, including preprocessing, integration, and downstream cell-type–specific analyses.
 
 ---
 
-# 1. Single-cell RNA-seq Pipeline 
+## Pipeline Overview
 
-This pipeline processes raw 10x Genomics data through integration and **cell-type–specific analyses**, with modular scripts for reproducibility and scalability.
-
----
-
-## Pipeline Overview 
+This workflow processes raw 10x Genomics data through integration and biological interpretation:
 
 1. **Cell Ranger** — alignment and gene quantification
 2. **CellBender** — ambient RNA correction
 3. **QC & filtering** — per-sample Seurat objects
 4. **Integration (Seurat + Harmony)** — clustering and annotation
-5. **Downstream analyses** — cell-type–specific (e.g., microglia)
-6. **Pseudobulk + pathway analysis**
+5. **Cell-type–specific analyses** (e.g., microglia)
+6. **Pseudobulk differential expression and pathway analysis**
 7. **Pilot vs postmortem comparison**
 
 ---
@@ -55,57 +44,32 @@ Single_Cell/
 
 ---
 
-## Scripts (New_miBrain)
+## Core Pipeline (New_miBrain)
 
-### 1. Cell Ranger
+### Preprocessing
 
-**Script:** `run_cellranger_all.sh`
+**Cell Ranger** (`run_cellranger_all.sh`)
 
-* Aligns FASTQ files
-* Generates gene × cell count matrices
-* Performs initial QC
+* Alignment and count matrix generation
 
-**Run:**
+**CellBender** (`run_cellbender_all.sh`)
 
-```bash
-./run_cellranger_all.sh
-```
+* Ambient RNA removal
 
 ---
 
-### 2. CellBender
+### QC and Integration
 
-**Script:** `run_cellbender_all.sh`
-
-* Removes ambient/background RNA contamination
-* Produces corrected `.h5` matrices
-
-```bash
-./run_cellbender_all.sh
-```
-
----
-
-### 3. QC and Filtering
-
-**Script:** `miBrain_QC_filtering.R`
+**QC Filtering** (`miBrain_QC_filtering.R`)
 
 * Filters low-quality cells
-* Applies thresholds (features, counts, mitochondrial %)
 * Outputs per-sample Seurat objects
 
----
-
-### 4. Integration, Clustering, Annotation
-
-**Script:** `Seurat_integration_harmony.R`
+**Integration** (`Seurat_integration_harmony.R`)
 
 * SCTransform normalization
-* Integration across samples
 * Harmony batch correction
-* UMAP + clustering
-* Marker detection (`FindAllMarkers`)
-* Cell-type annotation
+* Clustering, UMAP, and annotation
 
 **Run:**
 
@@ -114,88 +78,48 @@ module load R/4.2.0
 Rscript Seurat_integration_harmony.R
 ```
 
-**Edit inside script:**
+---
 
-* `qc_list_path`
-* `output_dir`
+### Cell-type–specific Analysis
+
+**Microglia Analysis** (`microglia_subset_signatures.R`)
+
+* Subclustering and module scoring
+* Functional annotation
 
 ---
 
-### 5. Microglia Subclustering & Signatures
+### Pseudobulk & Pathway Analysis
 
-**Script:** `microglia_subset_signatures.R`
+**DEG Analysis** (`Pseudobulk_edgeR.R`)
 
-* Identifies microglia via module scoring
-* Subsets and reclusters microglia
-* Computes functional gene modules
-* Generates figures and summary tables
+* Pseudobulk aggregation
+* Differential expression (edgeR)
 
----
+**Pathway Analysis** (`Pseudobulk_Dream_Pathway_analysis.R`)
 
-### 6. Pseudobulk Differential Expression
+* Linear modeling (dream)
+* GSEA / GO / KEGG
 
-**Script:** `Pseudobulk_edgeR.R`
+**Composition Analysis** (`Propeller_Camera.R`)
 
-* Aggregates counts per sample/cell type
-* Performs DEG analysis using **edgeR**
-* Enables genotype comparisons (e.g., G/G vs A/A)
-
----
-
-### 7. Pathway Analysis (Dream / GSEA)
-
-**Script:** `Pseudobulk_Dream_Pathway_analysis.R`
-
-* Linear modeling with **dream (variancePartition)**
-* Gene set enrichment (GSEA/GO/KEGG)
-* Identifies pathway-level differences
-
----
-
-### 8. Cell Type Composition Analysis
-
-**Script:** `Propeller_Camera.R`
-
-* Differential abundance testing (propeller)
-* Gene set testing (camera)
-* Evaluates compositional changes across conditions
+* Cell-type proportion testing
+* Gene set testing
 
 ---
 
 ## Pilot vs Postmortem Comparison
 
-**Location:**
+Location:
 `Single_Cell/P2RY12/pilot_postmortem_comparison/`
 
-### Key Analyses
+### Analyses
 
-**Data Integration**
-
-* `Merged_pilot_analysis.R`
-
-  * Merges pilot + postmortem datasets
-  * Harmonizes metadata and annotations
-
-**Cell Type Abundance**
-
-* `PM_abundance.R`
-* `PM_pilot_abundance_comparison.R`
-
-  * Compares cell-type proportions
-  * Identifies shifts across datasets
-
-**DEG Concordance**
-
-* `PM_pilot_DEG_correlation_concordance.R`
-
-  * Correlates DEG signatures between MiBrain and postmortem datasets
-
-**State-Specific DEG Analysis**
-
-* `state_specific_DEG.R`
-
-  * Identifies DEGs within specific cell states
-  * Enables cross-system validation
+* **Merged_pilot_analysis.R** — dataset integration
+* **PM_abundance.R** — cell-type proportions in postmortem data
+* **PM_pilot_abundance_comparison.R** — comparison of cell-type proportions between MiBrain and postmortem datasets
+* **PM_pilot_DEG_correlation_concordance.R** — DEG concordance between MiBrain and postmortem datasets
+* **state_specific_DEG.R** — state-level differential expression across datasets
 
 ---
 
@@ -214,54 +138,9 @@ Rscript Seurat_integration_harmony.R
 
 ---
 
-## Bulk RNA-seq Pipeline
-
-### Workflow
-
-1. RAPiD — preprocessing, QC, alignment
-2. Collation — combine count matrices
-3. DEG analysis — DESeq2
-4. Pathway analysis — GSEA + ORA
-
----
-
-### Folder Structure
-
-```text
-Bulk/
-├── scripts/
-│   ├── 00_run_RAPiD.sh
-│   ├── 01_collate_samples.R
-│   ├── BULK_rnaseq_DEG.R
-│   └── BULK_rnaseq_pathway_1.R
-└── docs/
-```
-
----
-
-### Key Tools
-
-* Alignment: STAR
-* Quantification: featureCounts, Salmon, Kallisto
-* DEG: DESeq2
-* Pathways: fgsea, clusterProfiler
-
----
-
-## Documentation
-
-* `Bulk/docs/`
-* Recommended additions:
-
-  * `integration_notes.md`
-  * `cellbender_qc_notes.md`
-
----
-
 ## Notes
 
 * Designed for **Minerva HPC execution**
 * Paths should be customized per project
 * Pipeline is modular and stepwise
 * Optimized for **MiBrain P2RY12 variant analysis and cross-system validation**
-
