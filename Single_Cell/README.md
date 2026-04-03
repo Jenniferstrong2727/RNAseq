@@ -1,100 +1,207 @@
 # RNA-seq Pipelines (MiBrain / Minerva)
 
-This repository contains pipelines and documentation for running both **single-cell** and **bulk RNA-seq** analyses on the Minerva HPC cluster.
-
-- `Single_Cell/` — 10x Genomics single-cell RNA-seq preprocessing, QC, integration, and downstream cell-type–specific analyses  
-- `Bulk/` — bulk RNA-seq analysis using RAPiD, DESeq2, and pathway analysis (GSEA + ORA)
+This repository contains end-to-end pipelines for **single-cell** and **bulk RNA-seq** analyses performed on the **Minerva HPC cluster**, with a focus on the **P2RY12 MiBrain project**.
 
 ---
 
-## 1. Single-cell RNA-seq Pipeline (MiBrain / Minerva)
+## Repository Overview
 
-This pipeline covers preprocessing, QC, integration, and downstream analyses for MiBrain single-cell RNA-seq data on Minerva.
-
-### Overview of steps (exact order)
-
-1. **Cell Ranger** — alignment and gene-level quantification  
-2. **CellBender** — ambient/background RNA removal  
-3. **QC and filtering** (per-sample)  
-4. **Seurat + Harmony integration, clustering, and annotation**  
-5. **Cell-type–specific downstream analyses** (e.g., microglia)
+* `Single_Cell/` — MiBrain single-cell RNA-seq preprocessing, integration, and downstream analyses
+* `Bulk/` — bulk RNA-seq processing, differential expression, and pathway analysis
 
 ---
 
-### Folder structure
+# 1. Single-cell RNA-seq Pipeline 
+
+This pipeline processes raw 10x Genomics data through integration and **cell-type–specific analyses**, with modular scripts for reproducibility and scalability.
+
+---
+
+## Pipeline Overview 
+
+1. **Cell Ranger** — alignment and gene quantification
+2. **CellBender** — ambient RNA correction
+3. **QC & filtering** — per-sample Seurat objects
+4. **Integration (Seurat + Harmony)** — clustering and annotation
+5. **Downstream analyses** — cell-type–specific (e.g., microglia)
+6. **Pseudobulk + pathway analysis**
+7. **Pilot vs postmortem comparison**
+
+---
+
+## Folder Structure
 
 ```text
 Single_Cell/
-├── scripts/
-│   ├── run_cellranger_all.sh
-│   ├── run_cellbender_all.sh
-│   ├── miBrain_QC_filtering.R
-│   ├── Seurat_integration_harmony.R
-│   └── microglia_subset_signatures.R
-└── docs/
-    └── (analysis notes, troubleshooting, etc.)
+└── P2RY12/
+    ├── New_miBrain/
+    │   └── SCRIPTS/
+    │       ├── run_cellranger_all.sh
+    │       ├── run_cellbender_all.sh
+    │       ├── miBrain_QC_filtering.R
+    │       ├── Seurat_integration_harmony.R
+    │       ├── microglia_subset_signatures.R
+    │       ├── Pseudobulk_edgeR.R
+    │       ├── Pseudobulk_Dream_Pathway_analysis.R
+    │       └── Propeller_Camera.R
+    │
+    └── pilot_postmortem_comparison/
+        ├── Merged_pilot_analysis.R
+        ├── PM_abundance.R
+        ├── PM_pilot_abundance_comparison.R
+        ├── PM_pilot_DEG_correlation_concordance.R
+        └── state_specific_DEG.R
+```
 
+---
 
-1.1 Cell Ranger
-Script:
-Single_Cell/scripts/run_cellranger_all.sh
-Runs 10x Genomics Cell Ranger for all samples in the project. This step:
-Aligns reads
-Performs basic QC
-Generates gene-level count matrices (per sample)
-Example usage (on Minerva):
-./Single_Cell/scripts/run_cellranger_all.sh
-(See comments inside the script for required input paths and sample lists.)
-1.2 CellBender
-Script:
-Single_Cell/scripts/run_cellbender_all.sh
-Runs CellBender on the Cell Ranger outputs to remove ambient/background RNA.
-Example usage (on Minerva):
-./Single_Cell/scripts/run_cellbender_all.sh
-This produces cleaned HDF5 matrices (one per sample), which can then be loaded directly into R / Seurat.
-1.3 QC and filtering (per-sample)
-Script:
-Single_Cell/scripts/miBrain_QC_filtering.R
-This script is run on individual samples after CellBender and performs:
-Cell-level QC filtering (features, counts, mitochondrial content)
-Removal of low-quality cells
-Creation of QC’d per-sample Seurat objects
-This step does not perform cell-type annotation and must be run before integration.
-1.4 Seurat + Harmony integration, clustering, and annotation
-Script:
-Single_Cell/scripts/Seurat_integration_harmony.R
-This script integrates multiple QC’d single-cell samples using Seurat and Harmony. It:
-Loads a list of QC’d Seurat objects (one per sample)
-Runs SCTransform normalization
-Performs SCT-based integration across samples
-Applies Harmony batch correction on PCA embeddings
-Computes neighbors, clusters, and UMAP
-Finds cluster markers with FindAllMarkers
-Performs cell-type annotation
-Example usage (on Minerva):
+## Scripts (New_miBrain)
+
+### 1. Cell Ranger
+
+**Script:** `run_cellranger_all.sh`
+
+* Aligns FASTQ files
+* Generates gene × cell count matrices
+* Performs initial QC
+
+**Run:**
+
+```bash
+./run_cellranger_all.sh
+```
+
+---
+
+### 2. CellBender
+
+**Script:** `run_cellbender_all.sh`
+
+* Removes ambient/background RNA contamination
+* Produces corrected `.h5` matrices
+
+```bash
+./run_cellbender_all.sh
+```
+
+---
+
+### 3. QC and Filtering
+
+**Script:** `miBrain_QC_filtering.R`
+
+* Filters low-quality cells
+* Applies thresholds (features, counts, mitochondrial %)
+* Outputs per-sample Seurat objects
+
+---
+
+### 4. Integration, Clustering, Annotation
+
+**Script:** `Seurat_integration_harmony.R`
+
+* SCTransform normalization
+* Integration across samples
+* Harmony batch correction
+* UMAP + clustering
+* Marker detection (`FindAllMarkers`)
+* Cell-type annotation
+
+**Run:**
+
+```bash
 module load R/4.2.0
-Rscript Single_Cell/scripts/Seurat_integration_harmony.R
-Before running, edit the top of Seurat_integration_harmony.R and set:
-qc_list_path – path to the saved list of QC’d per-sample Seurat objects
-output_dir – directory where integrated objects, plots, and marker tables will be written
-1.5 Microglia subset and gene signature analysis
-Script:
-Single_Cell/scripts/microglia_subset_signatures.R
-This script is run after integration and operates on an integrated Seurat object. It performs:
-Identification of microglia using module scores
-Subsetting and reprocessing of microglia
-Microglial subclustering
-Module scoring and cluster-level summaries
-Generation of figures and heatmaps
-Saving of a microglia-specific Seurat object
-1.6 Docs and notes (Single-cell)
-Additional notes, version info, and troubleshooting tips for the single-cell pipeline live under:
-Single_Cell/docs/
-Suggested files:
-Seurat_integration_harmony_notes.md
-cellranger_cellbender_pipeline_notes.md
-1.7 Example MiBrain project layout on Minerva
-For reference, a typical project directory for MiBrain P2RY12 single-cell data:
+Rscript Seurat_integration_harmony.R
+```
+
+**Edit inside script:**
+
+* `qc_list_path`
+* `output_dir`
+
+---
+
+### 5. Microglia Subclustering & Signatures
+
+**Script:** `microglia_subset_signatures.R`
+
+* Identifies microglia via module scoring
+* Subsets and reclusters microglia
+* Computes functional gene modules
+* Generates figures and summary tables
+
+---
+
+### 6. Pseudobulk Differential Expression
+
+**Script:** `Pseudobulk_edgeR.R`
+
+* Aggregates counts per sample/cell type
+* Performs DEG analysis using **edgeR**
+* Enables genotype comparisons (e.g., G/G vs A/A)
+
+---
+
+### 7. Pathway Analysis (Dream / GSEA)
+
+**Script:** `Pseudobulk_Dream_Pathway_analysis.R`
+
+* Linear modeling with **dream (variancePartition)**
+* Gene set enrichment (GSEA/GO/KEGG)
+* Identifies pathway-level differences
+
+---
+
+### 8. Cell Type Composition Analysis
+
+**Script:** `Propeller_Camera.R`
+
+* Differential abundance testing (propeller)
+* Gene set testing (camera)
+* Evaluates compositional changes across conditions
+
+---
+
+## Pilot vs Postmortem Comparison
+
+**Location:**
+`Single_Cell/P2RY12/pilot_postmortem_comparison/`
+
+### Key Analyses
+
+**Data Integration**
+
+* `Merged_pilot_analysis.R`
+
+  * Merges pilot + postmortem datasets
+  * Harmonizes metadata and annotations
+
+**Cell Type Abundance**
+
+* `PM_abundance.R`
+* `PM_pilot_abundance_comparison.R`
+
+  * Compares cell-type proportions
+  * Identifies shifts across datasets
+
+**DEG Concordance**
+
+* `PM_pilot_DEG_correlation_concordance.R`
+
+  * Correlates DEG signatures between MiBrain and postmortem datasets
+
+**State-Specific DEG Analysis**
+
+* `state_specific_DEG.R`
+
+  * Identifies DEGs within specific cell states
+  * Enables cross-system validation
+
+---
+
+## Example Project Layout (Minerva)
+
+```text
 /sc/arion/projects/ad-omics/Jennifer/scRNA_mibrain_P2RY12
 ├── 00_fastq/
 ├── 01_pilot_fastq/
@@ -103,17 +210,24 @@ For reference, a typical project directory for MiBrain P2RY12 single-cell data:
 ├── 04_seurat_objects/
 ├── logs/
 └── metadata/
-Convenience commands:
-./Single_Cell/scripts/run_cellranger_all.sh
-./Single_Cell/scripts/run_cellbender_all.sh
-2. Bulk RNA-seq Pipeline Overview
-The bulk RNA-seq pipeline is organized into four main stages:
-RAPiD — preprocessing, QC, alignment, and quantification
-Collate samples (coming soon) — combine featureCounts outputs
-DEG analysis — differential expression with DESeq2
-Pathway analysis — GSEA + ORA
-Detailed documentation for each stage lives in Bulk/docs/.
-2.1 Repository structure (Bulk)
+```
+
+---
+
+## Bulk RNA-seq Pipeline
+
+### Workflow
+
+1. RAPiD — preprocessing, QC, alignment
+2. Collation — combine count matrices
+3. DEG analysis — DESeq2
+4. Pathway analysis — GSEA + ORA
+
+---
+
+### Folder Structure
+
+```text
 Bulk/
 ├── scripts/
 │   ├── 00_run_RAPiD.sh
@@ -121,45 +235,33 @@ Bulk/
 │   ├── BULK_rnaseq_DEG.R
 │   └── BULK_rnaseq_pathway_1.R
 └── docs/
-    ├── RAPiD_details.md
-    ├── RAPiD_tips_jen.md
-    └── DEG_pathway_details.md
-2.2 RAPiD — preprocessing / alignment / QC
-RAPiD performs:
-Adapter trimming (Trimmomatic)
-QC (FastQC, Picard)
-Alignment (STAR)
-Gene quantification (featureCounts, Salmon, Kallisto, RSEM)
-Splicing analysis (LeafCutter)
-Aggregated QC reports (MultiQC)
-See:
-Bulk/docs/RAPiD_details.md
-Bulk/docs/RAPiD_tips_jen.md
-2.3 Collate samples (coming soon)
-Planned stage to:
-Read RAPiD featureCounts outputs
-Combine them into a unified gene × sample matrix
-Prepare inputs for DESeq2
-Planned locations:
-Bulk/scripts/01_collate_samples.R
-Bulk/docs/collate_samples_details.md
-2.4 DEG analysis — DESeq2
-Script:
-Bulk/scripts/BULK_rnaseq_DEG.R
-Takes as input:
-featureCounts matrix
-Sample metadata
-Produces:
-results_raw.rds
-results_shrunken_apeglm.rds
-QC plots and result tables
-See Bulk/docs/DEG_pathway_details.md.
-2.5 Pathway analysis — GSEA + ORA
-Script:
-Bulk/scripts/BULK_rnaseq_pathway_1.R
-Uses DESeq2 output to perform:
-GSEA (fgseaMultilevel)
-ORA (KEGG, GO BP, Hallmark) via clusterProfiler
-Standard enrichment plots
-2.6 Bulk documentation summary
-All bulk RNA-seq documentation lives under Bulk/docs/.
+```
+
+---
+
+### Key Tools
+
+* Alignment: STAR
+* Quantification: featureCounts, Salmon, Kallisto
+* DEG: DESeq2
+* Pathways: fgsea, clusterProfiler
+
+---
+
+## Documentation
+
+* `Bulk/docs/`
+* Recommended additions:
+
+  * `integration_notes.md`
+  * `cellbender_qc_notes.md`
+
+---
+
+## Notes
+
+* Designed for **Minerva HPC execution**
+* Paths should be customized per project
+* Pipeline is modular and stepwise
+* Optimized for **MiBrain P2RY12 variant analysis and cross-system validation**
+
